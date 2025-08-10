@@ -15,21 +15,26 @@
 #
 ################################################################################
 
+"""模型入口模块，提供不同模型类的统一导出与选择逻辑"""
+
 from .glm import GLM
 from .llama import Llama
 from .qwen import Qwen2
 from .phi3 import Phi3
 
+
 def choose_model_class(model_name):
-    if 'llama' in model_name.lower():
+    """根据模型名称返回对应的模型类"""
+    name = model_name.lower()
+    if 'llama' in name:
         return Llama
-    elif 'glm' in model_name.lower():
+    if 'glm' in name:
         return GLM
-    elif 'yi' in model_name.lower():
+    if 'yi' in name:
         return Llama
-    elif 'qwen' in model_name.lower():
+    if 'qwen' in name:
         return Qwen2
-    elif 'phi' in model_name.lower():
+    if 'phi' in name:
         return Phi3
-    else:
-        raise ValueError(f"Model {model_name} not found")
+    raise ValueError(f"Model {model_name} not found")
+

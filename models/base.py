@@ -15,7 +15,7 @@
 #
 ################################################################################
 
-# Base LLM class
+"""基础 LLM 抽象类，封装通用的推理流程与 KV 缓存管理"""
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +29,7 @@ from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
 from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
 
 class LLM:
+    """所有具体模型的基类，提供通用接口"""
 
     def __str__(self) -> str:
         gpu_mem = f"{round(torch.cuda.memory_allocated(self.device) / 1024**3, 2)} GB / {round(torch.cuda.get_device_properties(self.device).total_memory / 1024**3, 2)} GB"

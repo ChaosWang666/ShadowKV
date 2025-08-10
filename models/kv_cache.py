@@ -15,6 +15,12 @@
 #
 ################################################################################
 
+"""
+该模块实现了不同形式的 Key/Value 缓存结构，包括最基础的全量注意力缓存
+以及用于稀疏注意力的 ShadowKV 缓存。通过这些缓存可以在生成式推理中
+高效地复用历史状态，减少重复计算与显存开销。
+"""
+
 import torch
 import math
 import gc
@@ -22,19 +28,25 @@ from torch import nn
 from models.tensor_op import batch_gather_gemm_rotary_pos_emb_cuda
 from kernels import shadowkv
 
+
 class KV_Cache:
-    """Full Attention"""
-    def __init__(self, 
+    """全量注意力模式下的 KV 缓存管理类"""
+    def __init__(self,
         config :object,
         batch_size :int = 1,
-        max_length :int = 32*1024, 
+        max_length :int = 32*1024,
         device :str = 'cuda:0',
         dtype = torch.bfloat16) -> None:
 
+        # 保存模型结构及缓存的基本配置信息
         self.config = config
-        self.max_length = max_length
-        self.device = device
-        self.dtype = dtype
+        self.max_length = max_length               # 支持的最长序列长度
+        self.device = device                       # 缓存所在的计算设备
+        self.dtype = dtype                         # 缓存张量的数据类型
+
+        # 初始化 Key/Value 缓存，形状为
+        # [num_layers, batch, kv_heads, max_length, head_dim]
+        # 由于推理过程中长度逐步增加，这里先在 CPU 上分配最大空间
         self.k_cache = torch.zeros(
             config.num_hidden_layers,
             batch_size,
@@ -55,9 +67,9 @@ class KV_Cache:
             dtype=self.dtype
         )
         self.num_layers = config.num_hidden_layers
-        self.kv_offset = 0
+        self.kv_offset = 0                         # 当前已缓存的序列长度
 
-        # batch prefill record
+        # 用于批量前缀填充的记录指针
         self.prefilled_batch = 0
         self.batch_size = batch_size
 
@@ -67,32 +79,47 @@ class KV_Cache:
             layer_idx :int
             ):
 
-        bsz, _, incoming, _ = new_v_cache.shape # [bsz, num_kv_heads, incoming, head_dim]
+        bsz, _, incoming, _ = new_v_cache.shape  # [bsz, num_kv_heads, incoming, head_dim]
 
+        # 如果一次性写入完整 batch，则需要重置 prefilled_batch
         if bsz == self.batch_size:
             self.prefilled_batch = 0
 
-        self.k_cache[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, self.kv_offset:self.kv_offset + incoming].copy_(new_k_cache)
-        self.v_cache[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, self.kv_offset:self.kv_offset + incoming].copy_(new_v_cache)
+        # 将新的 key/value 片段拷贝到缓存的连续位置
+        self.k_cache[layer_idx][
+            self.prefilled_batch:self.prefilled_batch + bsz,
+            :,
+            self.kv_offset:self.kv_offset + incoming
+        ].copy_(new_k_cache)
+        self.v_cache[layer_idx][
+            self.prefilled_batch:self.prefilled_batch + bsz,
+            :,
+            self.kv_offset:self.kv_offset + incoming
+        ].copy_(new_v_cache)
 
+        # 取出当前层已经缓存的所有 key/value 供后续注意力使用
         key = self.k_cache[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, :self.kv_offset + incoming]
         value = self.v_cache[layer_idx][self.prefilled_batch:self.prefilled_batch + bsz, :, :self.kv_offset + incoming]
 
-        if incoming > 1: # prefill
+        # 当 incoming>1 时表示处于前缀阶段，需要将缓存转移到 GPU 上
+        if incoming > 1:  # prefill
             key = key.to(self.device)
             value = value.to(self.device)
 
+        # 更新偏移量。只有在所有层都写入后才增加 kv_offset
         if layer_idx == self.num_layers - 1:
             self.prefilled_batch += bsz
             if self.prefilled_batch == self.batch_size:
                 self.kv_offset += incoming
-        
+
         return key.to(self.device), value.to(self.device)
     
     def print_stats(self):
+        """打印缓存的状态信息，便于调试"""
         print(f"KVCache | max_length {self.max_length} | dtype {self.dtype} | cached {self.kv_offset}")
 
     def H2D(self):
+        """将缓存从 CPU 转移到 GPU，通常在前缀阶段调用"""
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -100,14 +127,16 @@ class KV_Cache:
         self.v_cache = self.v_cache.to(self.device)
 
     def clear(self):
+        """重置缓存状态，开始新的推理"""
         self.kv_offset = 0
         self.prefilled_batch = 0
 
     def get_kv_len(self):
+        """返回当前已缓存的序列长度"""
         return self.kv_offset
 
 class ShadowKVCache:
-    """ShadowKV, only for accuracy measurement and understanding, not for efficiency, please refer to ShadowKV_CPU for the efficient implementation"""
+    """ShadowKV 稀疏缓存的 GPU 参考实现"""
     def __init__(self, 
         config :object,
         batch_size :int = 1,
@@ -119,6 +148,7 @@ class ShadowKVCache:
         rank=160,
         ) -> None:
         
+        # 基础配置信息
         self.config = config
         self.batch_size = batch_size
         self.max_length = max_length
@@ -129,6 +159,7 @@ class ShadowKVCache:
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
 
+        # ShadowKV 参数设置
         self.sparse_budget = int(sparse_budget)
         self.chunk_size = chunk_size
         self.rank = rank
@@ -193,7 +224,8 @@ class ShadowKVCache:
         print(f"ShadowKV | sparse budget {self.sparse_budget} | chunk size {self.chunk_size} |rank {self.rank} | cached {self.kv_offset} | local_chunk {self.local_chunk} | outlier_chunk {self.outlier_chunk}")
 
     def get_svd(self, new_k_cache, layer_idx):
-        # [bsz, 8, prefill, 128] OR [bsz, prefill, 1024]
+        """对输入的 Key 片段做 SVD 分解并缓存，用于后续稀疏重建"""
+        # new_k_cache 形状可为 [bsz, 8, prefill, 128] 或 [bsz, prefill, 1024]
         if new_k_cache.shape[1] <= 32:
             # [bsz, 8, prefill, 128] --> [bsz, prefill, 1024]
             k_cache = new_k_cache.transpose(1, 2).reshape(self.batch_size, -1, self.num_key_value_heads*self.head_dim)
@@ -213,6 +245,7 @@ class ShadowKVCache:
         self.SV[layer_idx].copy_(torch.matmul(torch.diag_embed(s[:, :self.rank]), v[:, :self.rank]).to(self.dtype).view(self.batch_size, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)) # [bsz, 8, 160, 128]
     
     def register_k_landmark(self, k_landmark, k_landmark_idx, layer_idx):
+        """注册 landmark，用于后续检索"""
         num_landmarks = k_landmark.shape[-2]
         if layer_idx == 0:
             # init k_landmark, k_landmark_idx
@@ -228,8 +261,9 @@ class ShadowKVCache:
             key_states_roped: torch.Tensor,
             query: torch.Tensor=None
             ):
-        
-        incoming = new_v_cache.shape[-2] # [bsz, num_kv_heads, incoming, head_dim]
+        """在前缀阶段将初始的 KV 写入缓存并计算 landmark"""
+
+        incoming = new_v_cache.shape[-2]  # [bsz, num_kv_heads, incoming, head_dim]
         self.prefill = incoming
         self.v_cache_cpu[layer_idx][:, :, :incoming] = new_v_cache.clone()
 
@@ -245,10 +279,14 @@ class ShadowKVCache:
         self.v_cache_buffer[layer_idx][:, :, :self.prefill_local].copy_(new_v_cache[:, :, -self.prefill_local:])
 
         key_states_roped_ctx = key_states_roped[:,:,:self.chunks*self.chunk_size].view(self.batch_size, self.num_key_value_heads, self.chunks, self.chunk_size, self.head_dim)
-        landmark_candidates = key_states_roped_ctx.mean(dim=-2) # [bsz, kv_heads, chunks, head_dim]
+        landmark_candidates = key_states_roped_ctx.mean(dim=-2)  # [bsz, kv_heads, chunks, head_dim]
         
         # compute the cos similarity between it and the original key cache
-        cos_sim = torch.nn.functional.cosine_similarity(landmark_candidates.unsqueeze(3).expand(-1, -1, -1, self.chunk_size, -1), key_states_roped_ctx, dim=-1) # [bsz, kv_heads, chunks, chunk_size]
+        cos_sim = torch.nn.functional.cosine_similarity(
+            landmark_candidates.unsqueeze(3).expand(-1, -1, -1, self.chunk_size, -1),
+            key_states_roped_ctx,
+            dim=-1
+        )  # [bsz, kv_heads, chunks, chunk_size]
         
         # get the outlier_chunk idx for each head # [bsz, kv_heads, outlier_chunk]
         outlier_chunk_idx = cos_sim.min(dim=-1).values.topk(self.outlier_chunk, largest=False).indices
@@ -281,30 +319,33 @@ class ShadowKVCache:
             self.kv_offset += incoming
 
     def get_retrieval_position_ids(self, layer_idx, query_states):
+        """根据查询向量与 landmark 的相似度选出需要检索的块位置"""
         # self.k_landmark[layer_idx][:, :, :self.chunks] is [bsz, 8, chunks, head_dim]
-        # chunk_attn: [bsz, 32, window_size, chunks]
-        self.incoming_q_len = query_states.shape[-2] # 1
-        # print(query_states.view(-1, self.num_key_value_heads, self.num_key_value_groups, self.incoming_q_len, self.head_dim).shape, self.k_landmark[layer_idx].transpose(2, 3).shape)
-        # [bsz, 8, 4, q_len, 128] * [bsz, 8, 128, chunks] --> [bsz, 8, 4, q_len, chunks]
-        chunk_attn = torch.einsum('bhgqd,bhdc->bhgqc', query_states.view(-1, self.num_key_value_heads, self.num_key_value_groups, self.incoming_q_len, self.head_dim), self.k_landmark[layer_idx].transpose(2, 3)).squeeze(2) / math.sqrt(128)
-        chunk_attn = nn.functional.softmax(chunk_attn, dim=-1, dtype=torch.float32).to(self.dtype) # [bsz, 8, 4, q_len, chunks]
-        chunk_attn = chunk_attn.sum(dim = -2) # [bsz, 8, 4, chunks]
+        self.incoming_q_len = query_states.shape[-2]  # 当前 query 长度，通常为 1
+        chunk_attn = torch.einsum(
+            'bhgqd,bhdc->bhgqc',
+            query_states.view(-1, self.num_key_value_heads, self.num_key_value_groups, self.incoming_q_len, self.head_dim),
+            self.k_landmark[layer_idx].transpose(2, 3)
+        ).squeeze(2) / math.sqrt(128)
+        chunk_attn = nn.functional.softmax(chunk_attn, dim=-1, dtype=torch.float32).to(self.dtype)
+        chunk_attn = chunk_attn.sum(dim=-2)  # [bsz, kv_heads, chunks]
         if self.num_key_value_groups > 1:
-            chunk_attn, _ = torch.max(chunk_attn, dim=-2) # [bsz, 8, chunks]
-        merged_results = torch.topk(chunk_attn, k=self.select_sets, dim=-1).indices # [bsz, 8, select_sets(256)]
+            chunk_attn, _ = torch.max(chunk_attn, dim=-2)
+        merged_results = torch.topk(chunk_attn, k=self.select_sets, dim=-1).indices
 
-        # use merged_results to gather the position_ids: [bsz, 8, select_sets] --> [bsz, 8, select_sets]
-        selected_chunks = self.k_landmark_idx[layer_idx].gather(dim=-1, index=merged_results) # [bsz, 8, select_sets]
-
-        # this is chunk idx, which can be used to offload value cache and decide if the cache hits
+        # 根据选择的块获取其在原序列中的绝对位置
+        selected_chunks = self.k_landmark_idx[layer_idx].gather(dim=-1, index=merged_results)
         self.selected_chunk_idx[layer_idx].copy_(selected_chunks, non_blocking=True)
 
-        position_ids = (selected_chunks.unsqueeze(-1) * self.chunk_size + torch.arange(self.chunk_size, device=chunk_attn.device).unsqueeze(0).unsqueeze(0).unsqueeze(0)).view(self.batch_size, self.num_key_value_heads, -1) # [bsz, 8, select_sets * chunk_size]
+        position_ids = (
+            selected_chunks.unsqueeze(-1) * self.chunk_size +
+            torch.arange(self.chunk_size, device=chunk_attn.device).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        ).view(self.batch_size, self.num_key_value_heads, -1)
 
         return position_ids
         
     def get_value_cache(self, layer_idx, position_ids):
-        # gather value cache
+        """根据 position_ids 从 CPU 缓存中取出对应的 value"""
         value_ = self.v_cache_cpu[layer_idx].gather(dim=-2, index=position_ids.unsqueeze(-1).expand(-1, -1, -1, self.head_dim))
         self.v_cache_buffer[layer_idx][:, :, self.sparse_start:self.sparse_end].copy_(value_, non_blocking=True)
         gen_offset = self.gen_offset if layer_idx == self.num_layers - 1 else self.gen_offset + self.incoming_q_len
@@ -312,32 +353,28 @@ class ShadowKVCache:
         return self.v_cache_buffer[layer_idx][:, :, :self.sparse_end + gen_offset]
 
     def get_key_cache(self, layer_idx, position_ids, rope_func, cos_sin_cache):
-        # gather key cache and rope them
-        u = self.U[layer_idx] # [bsz, 128k, rank]
-        sv = self.SV[layer_idx] # [bsz, 8, rank, 128]
+        """根据 position_ids 从 SVD 结果重建并 RoPE 对应的 key"""
+        u = self.U[layer_idx]  # [bsz, 128k, rank]
+        sv = self.SV[layer_idx]  # [bsz, kv_heads, rank, head_dim]
 
-        # indexing, [bsz, 8, sparse_budget, rank]
-        index_expanded = position_ids.unsqueeze(-1).expand(-1, -1, -1, u.size(-1)) # [bsz, 8, sparse_budget, rank]
-        u_expand = u.unsqueeze(1).expand(-1, self.num_key_value_heads, -1, -1) # [bsz, 8, 128k, rank]
+        index_expanded = position_ids.unsqueeze(-1).expand(-1, -1, -1, u.size(-1))
+        u_expand = u.unsqueeze(1).expand(-1, self.num_key_value_heads, -1, -1)
         U_head = torch.gather(u_expand, 2, index_expanded)
 
-        # [bsz, 8, sparse_budget, rank] -matmul- [8, rank, 128] --> [bsz, 8, sparse_budget, 128]
         result = torch.einsum('bhrk,bhkd->bhrd', U_head, sv)
-
-        # rope the key cache
         result = rope_func(result, position_ids)
 
-        # send to buffer
         self.k_cache_buffer[layer_idx][:, :, self.sparse_start:self.sparse_end].copy_(result, non_blocking=True)
         gen_offset = self.gen_offset if layer_idx == self.num_layers - 1 else self.gen_offset + self.incoming_q_len
 
         return self.k_cache_buffer[layer_idx][:, :, :self.sparse_end + gen_offset]
 
-    def update_kv_cache(self, 
+    def update_kv_cache(self,
             new_k_cache :torch.Tensor,
             new_v_cache :torch.Tensor,
             layer_idx :int,
             ):
+        """在解码阶段追加新的 KV 片段"""
 
         incoming = new_k_cache.shape[-2]
         self.v_cache_buffer[layer_idx][:, :, self.sparse_end+self.gen_offset:self.sparse_end+self.gen_offset+incoming].copy_(new_v_cache, non_blocking=True)
@@ -348,6 +385,7 @@ class ShadowKVCache:
             self.gen_offset += incoming
 
     def clear(self):
+        """重置所有缓存与状态"""
         self.k_cache_buffer.zero_()
         self.v_cache_buffer.zero_()
         self.selected_chunk_idx.zero_()
@@ -369,7 +407,7 @@ class ShadowKVCache:
 
 
 class ShadowKVCache_CPU:
-    """ShadowKV, can be used for Llama-3-8B, Llama-3.1-8B, GLM-4-9B, Yi-200K"""
+    """ShadowKV 的 CPU 优化实现，支持更多模型与批量场景"""
     def __init__(self, 
         config :object,
         batch_size :int = 1,
@@ -381,6 +419,7 @@ class ShadowKVCache_CPU:
         rank=160,
         ) -> None:
         
+        # 基础配置信息
         self.config = config
         self.batch_size = batch_size
         self.max_length = max_length

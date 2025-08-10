@@ -15,6 +15,7 @@
 #
 ################################################################################
 
+"""Qwen2 模型的推理实现"""
 
 import torch
 import torch.nn.functional as F
@@ -31,6 +32,8 @@ from .prompt_template import Templates, Chat_Templates
 from .base import LLM
 
 class Qwen2Layer:
+    """保存单层 Qwen2 所需的权重"""
+
     def __init__(self, layer_idx) -> None:
         
         self.wq :torch.Tensor = None
@@ -93,7 +96,9 @@ class Qwen2Layer:
         self.bv = self.bv.to(device, non_blocking=True)
 
 class Qwen2(LLM):
-    def __init__(self, 
+    """Qwen2 模型封装"""
+
+    def __init__(self,
         model_name: str = "Qwen/Qwen2-7B-Instruct",
         batch_size :int = 1,
         max_length :int = 64*1024, 
