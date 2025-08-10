@@ -15,6 +15,7 @@
 #
 ################################################################################
 
+"""Phi-3 模型的推理与权重加载实现"""
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +31,8 @@ from .prompt_template import Templates, Chat_Templates
 from .base import LLM
 
 class Phi3Layer:
+    """保存单层 Phi-3 所需的权重"""
+
     def __init__(self, layer_idx) -> None:
         
         self.wqkv :torch.Tensor = None
@@ -70,7 +73,9 @@ class Phi3Layer:
         self.down_proj =  self.down_proj.to(device, non_blocking=True)
 
 class Phi3(LLM):
-    def __init__(self, 
+    """Phi-3 模型封装"""
+
+    def __init__(self,
         model_name: str = "microsoft/Phi-3-mini-128k-instruct",
         batch_size :int = 1,
         max_length :int = 64*1024, 

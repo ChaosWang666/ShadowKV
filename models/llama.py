@@ -15,6 +15,7 @@
 #
 ################################################################################
 
+"""Llama 模型的推理与权重加载实现"""
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +34,8 @@ from .prompt_template import Templates, Chat_Templates, Prefix_Templates
 from .base import LLM
 
 class LlamaLayer:
+    """保存单层 Llama 所需的权重"""
+
     def __init__(self, layer_idx) -> None:
         
         self.wqkv :torch.Tensor = None
@@ -75,7 +78,9 @@ class LlamaLayer:
         self.down_proj =  self.down_proj.to(device, non_blocking=True)
 
 class Llama(LLM):
-    def __init__(self, 
+    """Llama 模型封装"""
+
+    def __init__(self,
         model_name: str = "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
         batch_size :int = 1,
         max_length :int = 64*1024, 
