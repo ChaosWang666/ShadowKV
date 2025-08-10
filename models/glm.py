@@ -15,6 +15,8 @@
 #
 ################################################################################
 
+"""GLM 模型的简化推理实现"""
+
 import torch
 import torch.nn.functional as F
 import gc
@@ -33,6 +35,8 @@ from .prompt_template import Templates, Chat_Templates
 from .base import LLM
 
 class GLMLayer:
+    """存储单层 GLM 所需的权重"""
+
     def __init__(self, layer_idx) -> None:
         
         self.wqkv :torch.Tensor = None
@@ -86,7 +90,9 @@ class GLMConfig:
         self.num_attention_heads = config.num_attention_heads
 
 class GLM(LLM):
-    def __init__(self, 
+    """GLM 模型封装，继承自 LLM"""
+
+    def __init__(self,
         model_name: str = "THUDM/glm-4-9b-chat-1m",
         batch_size :int = 1,
         max_length :int = 64*1024, 

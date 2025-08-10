@@ -21,6 +21,8 @@
 # See LICENSE.txt for license information
 ################################################################################
 
+"""封装常用的张量运算与 GPU 内核调用"""
+
 import torch
 from torch.nn import functional as F
 

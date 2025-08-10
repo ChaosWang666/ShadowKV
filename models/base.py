@@ -15,7 +15,7 @@
 #
 ################################################################################
 
-# Base LLM class
+"""基础 LLM 抽象类，封装通用的推理流程与 KV 缓存管理"""
 
 import torch
 import torch.nn.functional as F
@@ -29,12 +29,22 @@ from .tensor_op import sample_token, layer_norm, minference_prefill_kernel
 from .kv_cache import KV_Cache, ShadowKVCache, ShadowKVCache_CPU
 
 class LLM:
+    """所有具体模型的基类，提供通用接口"""
 
     def __str__(self) -> str:
         gpu_mem = f"{round(torch.cuda.memory_allocated(self.device) / 1024**3, 2)} GB / {round(torch.cuda.get_device_properties(self.device).total_memory / 1024**3, 2)} GB"
         return f"LLM: {self.model_name}, attn_mode: {self.attn_mode}, max_length: {self.max_length}, batch_size: {self.batch_size}, device: {self.device}, dtype: {self.dtype}, GPU mem: {gpu_mem}"
 
     def init_kv_cache(self, sparse_budget: int, rank: int, chunk_size: int, config):
+        """根据注意力模式初始化不同类型的 KV 缓存。
+
+        参数:
+            sparse_budget (int): ShadowKV 模式下允许保留的稀疏 token 数。
+            rank (int): ShadowKV 中 SVD 分解的秩。
+            chunk_size (int): ShadowKV 的块大小。
+            config (object): 模型配置对象。
+        """
+
         if self.attn_mode == 'full':
             self.kv_cache = KV_Cache(config, max_length=self.max_length, device=self.device, dtype=self.dtype, batch_size=self.batch_size)
         elif self.attn_mode.lower() == 'shadowkv':
@@ -45,34 +55,62 @@ class LLM:
             raise ValueError(f"Invalid attention mode {self.attn_mode}")
 
     def print_kv_stats(self):
+        """输出当前 KV 缓存的统计信息。"""
+
         self.kv_cache.print_stats()
     
     def get_ctx(self, input_ids: torch.LongTensor):
+        """根据输入 token 生成对应的位置编码。
+
+        参数:
+            input_ids (torch.LongTensor): 当前输入的 token 序列。
+
+        返回:
+            torch.LongTensor: 与输入长度匹配的位置 ID。"""
+
         input_len = input_ids.size(1)
         past_len = self.kv_cache.get_kv_len()
         position_ids = torch.arange(past_len, past_len + input_len, device=self.device, dtype=torch.long).unsqueeze(0).repeat(input_ids.size(0), 1)
         return position_ids
 
     @torch.inference_mode()
-    def inference(self,
-            input_ids: torch.LongTensor,
-            position_ids: torch.LongTensor):
+    def inference(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor,
+    ):
+        """执行前向推理并返回 logits。
+
+        参数:
+            input_ids (torch.LongTensor): 输入的 token 序列。
+            position_ids (torch.LongTensor): 对应的位置编码。
+
+        返回:
+            torch.Tensor: 最后一步的 logits。"""
 
         hidden_states = F.embedding(input_ids, self.embed_tokens)
 
         for idx in range(self.num_layers):
             hidden_states = self.layer_compute(self.layers[idx], idx, hidden_states, position_ids)
-        
+
         hidden_states = layer_norm(hidden_states, w=self.norm_weight, eps=self.norm_variance_epsilon)
-        
-        if hidden_states.shape[1] > 16: # prefill
+
+        if hidden_states.shape[1] > 16:  # prefill
             hidden_states = hidden_states[:, -1:, :]
         logits = F.linear(hidden_states, self.lm_head).float()
-        
+
         return logits
 
     @torch.inference_mode()
     def prefill(self, input_ids: torch.LongTensor):
+        """在生成之前运行一次完整前缀推理并建立 KV 缓存。
+
+        参数:
+            input_ids (torch.LongTensor): 需要预填充的 token 序列。
+
+        返回:
+            torch.Tensor: 预填充阶段的输出 logits。"""
+
         self.kv_cache.clear()
         logits = self.inference(input_ids=input_ids, position_ids=self.get_ctx(input_ids))
 
@@ -81,10 +119,28 @@ class LLM:
 
     @torch.inference_mode()
     def prefill_cont(self, input_ids: torch.LongTensor):
+        """在已有 KV 缓存基础上继续预填充。
+
+        参数:
+            input_ids (torch.LongTensor): 追加的 token 序列。
+
+        返回:
+            torch.Tensor: 预填充后的输出 logits。"""
+
         logits = self.inference(input_ids=input_ids, position_ids=self.get_ctx(input_ids))
         return logits
     
     def encode(self, text: str, template=None, truncation=False):
+        """将字符串根据不同模板编码为 token 序列。
+
+        参数:
+            text (str): 待编码的文本。
+            template (str, 可选): 预定义的提示模板类型。
+            truncation (bool): 是否允许截断输入。
+
+        返回:
+            torch.LongTensor: 编码后的 token 序列。"""
+
         if template == 'chat':
             text = self.chat_template.format(msg=text)
             input_ids = self.tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.to(self.device)
@@ -99,11 +155,20 @@ class LLM:
         return input_ids
 
     @torch.inference_mode()
-    def layer_compute(self, 
-            buffer,
-            layer_idx :int, 
-            hidden_states: torch.FloatTensor, 
-            position_ids: torch.LongTensor):
+    def layer_compute(
+        self,
+        buffer,
+        layer_idx: int,
+        hidden_states: torch.FloatTensor,
+        position_ids: torch.LongTensor,
+    ):
+        """执行单层的注意力与前馈计算。
+
+        参数:
+            buffer: 当前层的权重缓冲对象。
+            layer_idx (int): 层索引。
+            hidden_states (torch.FloatTensor): 输入的隐状态。
+            position_ids (torch.LongTensor): 位置编码。"""
 
         residual = hidden_states
         bsz, q_len, _ = hidden_states.size()
@@ -112,7 +177,7 @@ class LLM:
             buffer,
             self.num_heads,
             self.num_key_value_heads,
-            self.head_dim
+            self.head_dim,
         )
         
         if isinstance(self.kv_cache, KV_Cache):
@@ -186,11 +251,44 @@ class LLM:
         return hidden_states
 
     def decode(self, input_ids: torch.Tensor, skip_special_tokens: bool = False):
+        """将 token 序列反解码为文本。
+
+        参数:
+            input_ids (torch.Tensor): 待解码的 token 序列。
+            skip_special_tokens (bool): 是否跳过特殊符号。
+
+        返回:
+            List[str]: 解码后的字符串列表。"""
+
         return self.tokenizer.batch_decode(input_ids, skip_special_tokens=skip_special_tokens)
 
     @torch.inference_mode()
-    def generate(self, input_ids: torch.Tensor, gen_len: int = 256, temperature: float = 0.0, top_p: float = 0.9, top_k :int = 50, verbose: bool = False, benchmark: bool = False, cont: bool = False):
-        """accuracy eval usage, not for throughput eval"""
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        gen_len: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        verbose: bool = False,
+        benchmark: bool = False,
+        cont: bool = False,
+    ):
+        """逐步生成文本序列。
+
+        参数:
+            input_ids (torch.Tensor): 输入的上下文 token。
+            gen_len (int): 生成的最大长度。
+            temperature (float): 采样温度。
+            top_p (float): nucleus 采样阈值。
+            top_k (int): top-k 采样数量。
+            verbose (bool): 是否实时打印生成内容。
+            benchmark (bool): 是否输出生成耗时。
+            cont (bool): 是否在已有缓存基础上继续生成。
+
+        返回:
+            torch.Tensor: 生成的 token 序列。"""
+
         assert type(input_ids) == torch.Tensor, f"input_ids must be a torch.Tensor, got {type(input_ids)}"
 
         # prefill
