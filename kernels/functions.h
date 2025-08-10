@@ -17,13 +17,56 @@
 ################################################################################
 */
 
+/**
+ * @file functions.h
+ * @brief ShadowKV CUDA 内核函数声明头文件
+ * 
+ * 本文件包含了 ShadowKV 项目中所有 CUDA 内核函数的声明，
+ * 这些函数实现了高效的稀疏注意力计算、KV 缓存管理和位置编码等核心功能。
+ * 
+ * 主要功能模块：
+ * 1. Gather-Copy 操作：实现稀疏注意力中的高效数据收集
+ * 2. 旋转位置编码 (RoPE)：多种优化版本的 RoPE 实现
+ * 3. 批量矩阵运算：融合的 GEMM 和 Softmax 操作
+ */
 
 #include <torch/extension.h>
 
+/**
+ * @brief 基础的 Gather-Copy 操作
+ * 
+ * 从 CPU 内存中根据位置 ID 收集 value 数据到 GPU 缓存中，
+ * 这是 ShadowKV 稀疏注意力的核心操作之一。
+ * 
+ * @param values CPU 上的 value 张量
+ * @param v_cache_buffer GPU 上的 value 缓存缓冲区
+ * @param position_ids 位置 ID 张量，指定要收集的数据位置
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param cpu_v_length CPU 上 value 的长度
+ * @param gpu_v_length GPU 上 value 缓存的长度
+ * @param map_size 映射表大小
+ */
 void gather_copy(
     torch::Tensor values, torch::Tensor v_cache_buffer, torch::Tensor position_ids,
     int batch_size, int heads, int cpu_v_length, int gpu_v_length, int map_size);
 
+/**
+ * @brief GPU 到 GPU 的带偏移量 Gather-Copy 操作（用于 keys）
+ * 
+ * 在 GPU 内存中直接进行 key 张量的 gather-copy 操作，
+ * 使用预计算的偏移量来优化内存访问模式。
+ * 
+ * @param keys GPU 上的 key 张量
+ * @param offsets 输入，由 reorder_keys_and_compute_offsets 计算的偏移量数组
+ * @param cnts 输入，由 reorder_keys_and_compute_offsets 计算的计数数组
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param gpu_k_length GPU 上 key 的长度
+ * @param gpu_k_offset GPU key 的起始偏移量
+ * @param gpu_k_stride GPU key 的步长
+ * @param map_size 映射表大小
+ */
 void gather_copy_d2d_with_offsets(
     torch::Tensor keys,             // gpu keys
     torch::Tensor offsets,          // input, offsets computed from reorder_keys_and_compute_offsets, size as elements (numBlocks*256)
@@ -34,6 +77,20 @@ void gather_copy_d2d_with_offsets(
     int gpu_k_stride, 
     int map_size);
 
+/**
+ * @brief 重排序 keys 并计算偏移量
+ * 
+ * 对位置 ID 进行重排序，并计算用于后续 gather-copy 操作的偏移量，
+ * 这是优化内存访问模式的关键步骤。
+ * 
+ * @param cached_pos_ids 输入输出，缓存的先前位置 ID，同时也是重排序后的位置 ID
+ * @param cur_pos_ids 输入，当前的位置 ID
+ * @param offsets 输出，用于 gather_copy_with_offsets 的偏移量数组
+ * @param cnts 输出，用于区分 device-to-device 和 host-to-device 的计数数组
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param map_size 映射表大小
+ */
 void reorder_keys_and_compute_offsets(
     torch::Tensor cached_pos_ids, // inout, as cached previous position id as input, also reordered position ids, int64_t type
     torch::Tensor cur_pos_ids,    // input, incoming position id, int64_t type
@@ -41,6 +98,26 @@ void reorder_keys_and_compute_offsets(
     torch::Tensor cnts,           // output, counts to separate d2d and h2d, size as numBlocks
     int batch_size, int heads, int map_size);
 
+/**
+ * @brief 带偏移量的 Gather-Copy 操作
+ * 
+ * 使用预计算的偏移量进行高效的 value 数据收集，
+ * 支持更复杂的内存访问模式和优化策略。
+ * 
+ * @param values 输入，CPU 上的 value 张量
+ * @param v_cache_buffer 输入输出，GPU 上的 value 缓存缓冲区
+ * @param temp 临时 GPU 内存，用于复制操作，大小与单层 v_cache_buffer 相同
+ * @param offsets 输入，由 reorder_keys_and_compute_offsets 计算的偏移量
+ * @param cnts 输入，由 reorder_keys_and_compute_offsets 计算的计数
+ * @param signals 额外的内部信号，全零数组，大小为 numBlocks
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param cpu_v_length CPU 上 value 的长度
+ * @param gpu_v_length GPU 上 value 的长度
+ * @param gpu_v_offset GPU value 的起始偏移量
+ * @param gpu_v_stride GPU value 的步长
+ * @param map_size 映射表大小
+ */
 void gather_copy_with_offsets(
     torch::Tensor values,           // input, cpu values
     torch::Tensor v_cache_buffer,   // inout, gpu values
@@ -50,6 +127,26 @@ void gather_copy_with_offsets(
     torch::Tensor signals,          // extra internal signals, all zeros sizes as numBlocks, size as numBlocks
     int batch_size, int heads, int cpu_v_length, int gpu_v_length, int gpu_v_offset, int gpu_v_stride, int map_size);
 
+/**
+ * @brief 基础的旋转位置编码 (RoPE) 应用
+ * 
+ * 对输入张量应用旋转位置编码，使用分离的 cos 和 sin 张量。
+ * 这是 RoPE 的标准实现版本。
+ * 
+ * @param x 输入张量（query 或 key）
+ * @param cos 余弦值张量
+ * @param sin 正弦值张量
+ * @param position_ids 位置 ID 张量
+ * @param output 输出张量
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param seq_len 序列长度
+ * @param embed_dim 嵌入维度
+ * @param stride_xb, stride_xh, stride_xs, stride_xe 输入张量的各维度步长
+ * @param stride_cos, stride_sin cos 和 sin 张量的步长
+ * @param stride_pid_b, stride_pid_h, stride_pid_s 位置 ID 张量的各维度步长
+ * @param half_dim 嵌入维度的一半
+ */
 void apply_rotary_pos_emb(
     torch::Tensor x, torch::Tensor cos, torch::Tensor sin, torch::Tensor position_ids, torch::Tensor output,
     int batch_size, int heads, int seq_len, int embed_dim,
@@ -58,6 +155,25 @@ void apply_rotary_pos_emb(
     int stride_pid_b, int stride_pid_h, int stride_pid_s,
     int half_dim);
 
+/**
+ * @brief 优化的旋转位置编码应用（新版本）
+ * 
+ * 使用融合的 cos_sin 张量来优化内存访问和计算效率，
+ * 相比基础版本减少了内存带宽需求。
+ * 
+ * @param x 输入张量（query 或 key）
+ * @param cos_sin 融合的余弦和正弦值张量
+ * @param position_ids 位置 ID 张量
+ * @param output 输出张量
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param seq_len 序列长度
+ * @param embed_dim 嵌入维度
+ * @param stride_xb, stride_xh, stride_xs, stride_xe 输入张量的各维度步长
+ * @param stride_cos_sin 融合 cos_sin 张量的步长
+ * @param stride_pid_b, stride_pid_h, stride_pid_s 位置 ID 张量的各维度步长
+ * @param half_dim 嵌入维度的一半
+ */
 void apply_rotary_pos_emb_new(
     torch::Tensor x, torch::Tensor cos_sin, torch::Tensor position_ids, torch::Tensor output,
     int batch_size, int heads, int seq_len, int embed_dim,
@@ -66,6 +182,26 @@ void apply_rotary_pos_emb_new(
     int stride_pid_b, int stride_pid_h, int stride_pid_s,
     int half_dim);
 
+/**
+ * @brief 旋转位置编码应用 v2 版本
+ * 
+ * 进一步优化的 RoPE 实现，支持分块处理来提高并行度和缓存效率，
+ * 特别适用于长序列的处理。
+ * 
+ * @param x 输入张量（query 或 key）
+ * @param cos_sin 融合的余弦和正弦值张量
+ * @param position_ids 位置 ID 张量
+ * @param output 输出张量
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param seq_len 序列长度
+ * @param embed_dim 嵌入维度
+ * @param stride_xb, stride_xh, stride_xs, stride_xe 输入张量的各维度步长
+ * @param stride_cos_sin 融合 cos_sin 张量的步长
+ * @param stride_pid_b, stride_pid_h, stride_pid_s 位置 ID 张量的各维度步长
+ * @param half_dim 嵌入维度的一半
+ * @param chunk_size 分块大小，用于优化内存访问
+ */
 void apply_rotary_pos_emb_new_v2(
     torch::Tensor x, torch::Tensor cos_sin, torch::Tensor position_ids, torch::Tensor output,
     int batch_size, int heads, int seq_len, int embed_dim,
@@ -74,6 +210,29 @@ void apply_rotary_pos_emb_new_v2(
     int stride_pid_b, int stride_pid_h, int stride_pid_s,
     int half_dim, int chunk_size);
 
+/**
+ * @brief 带缓存推送的旋转位置编码应用
+ * 
+ * 在应用 RoPE 的同时将结果推送到 KV 缓存中，
+ * 用于增量推理场景，避免重复计算和内存拷贝。
+ * 
+ * @param x 输入张量（query 或 key）
+ * @param cos_sin 融合的余弦和正弦值张量
+ * @param position_ids 位置 ID 张量
+ * @param output 输出张量
+ * @param cnts 计数张量，用于控制缓存推送
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param seq_len 序列长度
+ * @param embed_dim 嵌入维度
+ * @param stride_xb, stride_xh, stride_xs, stride_xe 输入张量的各维度步长
+ * @param stride_cos_sin 融合 cos_sin 张量的步长
+ * @param stride_pid_b, stride_pid_h, stride_pid_s 位置 ID 张量的各维度步长
+ * @param stride_output_b, stride_output_h, stride_output_s 输出张量的各维度步长
+ * @param offset_output_s_start, offset_output_s_end 输出序列的起始和结束偏移量
+ * @param half_dim 嵌入维度的一半
+ * @param chunk_size 分块大小
+ */
 void apply_rotary_pos_emb_push_cache(
     torch::Tensor x, torch::Tensor cos_sin, torch::Tensor position_ids, torch::Tensor output,
     torch::Tensor cnts,
@@ -85,6 +244,29 @@ void apply_rotary_pos_emb_push_cache(
     int offset_output_s_start, int offset_output_s_end,
     int half_dim, int chunk_size);
 
+/**
+ * @brief 优化的带缓存推送旋转位置编码应用
+ * 
+ * 进一步优化的缓存推送版本，通过改进的内存访问模式和计算策略
+ * 来提高性能，特别适用于高吞吐量的推理场景。
+ * 
+ * @param x 输入张量（query 或 key）
+ * @param cos_sin 融合的余弦和正弦值张量
+ * @param position_ids 位置 ID 张量
+ * @param output 输出张量
+ * @param cnts 计数张量，用于控制缓存推送
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param seq_len 序列长度
+ * @param embed_dim 嵌入维度
+ * @param stride_xb, stride_xh, stride_xs, stride_xe 输入张量的各维度步长
+ * @param stride_cos_sin 融合 cos_sin 张量的步长
+ * @param stride_pid_b, stride_pid_h, stride_pid_s 位置 ID 张量的各维度步长
+ * @param stride_output_b, stride_output_h, stride_output_s 输出张量的各维度步长
+ * @param offset_output_s_start, offset_output_s_end 输出序列的起始和结束偏移量
+ * @param half_dim 嵌入维度的一半
+ * @param chunk_size 分块大小
+ */
 void apply_rotary_pos_emb_push_cache_opt(
     torch::Tensor x, torch::Tensor cos_sin, torch::Tensor position_ids, torch::Tensor output,
     torch::Tensor cnts,
@@ -96,6 +278,29 @@ void apply_rotary_pos_emb_push_cache_opt(
     int offset_output_s_start, int offset_output_s_end,
     int half_dim, int chunk_size);
 
+/**
+ * @brief GLM 模型专用的优化缓存推送旋转位置编码应用
+ * 
+ * 专门为 GLM 模型架构优化的 RoPE 实现，考虑了 GLM 特有的
+ * 位置编码方式和注意力机制，提供最佳的性能表现。
+ * 
+ * @param x 输入张量（query 或 key）
+ * @param cos_sin 融合的余弦和正弦值张量
+ * @param position_ids 位置 ID 张量
+ * @param output 输出张量
+ * @param cnts 计数张量，用于控制缓存推送
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param seq_len 序列长度
+ * @param embed_dim 嵌入维度
+ * @param stride_xb, stride_xh, stride_xs, stride_xe 输入张量的各维度步长
+ * @param stride_cos_sin 融合 cos_sin 张量的步长
+ * @param stride_pid_b, stride_pid_h, stride_pid_s 位置 ID 张量的各维度步长
+ * @param stride_output_b, stride_output_h, stride_output_s 输出张量的各维度步长
+ * @param offset_output_s_start, offset_output_s_end 输出序列的起始和结束偏移量
+ * @param half_dim 嵌入维度的一半
+ * @param chunk_size 分块大小
+ */
 void apply_rotary_pos_emb_push_cache_opt_glm(
     torch::Tensor x, torch::Tensor cos_sin, torch::Tensor position_ids, torch::Tensor output,
     torch::Tensor cnts,
@@ -107,6 +312,29 @@ void apply_rotary_pos_emb_push_cache_opt_glm(
     int offset_output_s_start, int offset_output_s_end,
     int half_dim, int chunk_size);
 
+/**
+ * @brief 批量 Gather GEMM 操作
+ * 
+ * 结合稀疏注意力的批量矩阵乘法操作，同时集成了 RoPE 应用。
+ * 这是 ShadowKV 稀疏注意力计算的核心内核，通过 gather 操作
+ * 只计算重要的注意力权重，大幅减少计算量。
+ * 
+ * @param a 输入矩阵 A（通常是 query）
+ * @param b 输入矩阵 B（通常是 key）
+ * @param cos 余弦值张量，用于 RoPE
+ * @param sin 正弦值张量，用于 RoPE
+ * @param position_ids 位置 ID 张量
+ * @param output 输出张量
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param seq_len 序列长度
+ * @param embed_dim 嵌入维度
+ * @param rank SVD 分解的秩，用于稀疏注意力
+ * @param sparse_budget 稀疏预算，控制保留的注意力权重数量
+ * @param max_seq_len 最大序列长度
+ * @param chunk_size 分块大小
+ * @param offset_array 偏移量数组，用于 gather 操作
+ */
 void batch_gather_gemm(
     torch::Tensor a, torch::Tensor b,
     torch::Tensor cos, torch::Tensor sin,
@@ -115,6 +343,25 @@ void batch_gather_gemm(
     int batch_size, int heads, int seq_len, int embed_dim, int rank, int sparse_budget,
     int max_seq_len, int chunk_size, torch::Tensor offset_array);
 
+/**
+ * @brief 批量 GEMM 与 Softmax 融合操作
+ * 
+ * 将批量矩阵乘法和 Softmax 操作融合在一个内核中，
+ * 减少内存访问和提高计算效率，特别适用于注意力权重的计算。
+ * 
+ * @param A 输入矩阵 A
+ * @param B 输入矩阵 B
+ * @param D 输出矩阵 D（GEMM 结果）
+ * @param Norm 归一化因子张量
+ * @param Sum 求和张量，用于 Softmax 计算
+ * @param Softmax 输出的 Softmax 结果
+ * @param batch_count 批次数量
+ * @param m 矩阵维度 m
+ * @param n 矩阵维度 n
+ * @param k 矩阵维度 k
+ * @param alpha GEMM 操作的 alpha 参数
+ * @param beta GEMM 操作的 beta 参数
+ */
 void batch_gemm_softmax(torch::Tensor A, torch::Tensor B,
                         torch::Tensor D, torch::Tensor Norm, torch::Tensor Sum,
                         torch::Tensor Softmax, int batch_count, int m, int n,

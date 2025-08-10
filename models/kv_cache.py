@@ -78,7 +78,22 @@ class KV_Cache:
             new_v_cache :torch.Tensor,
             layer_idx :int
             ):
+        """
+        更新指定层的 Key/Value 缓存
+        
+        将新计算的 key/value 状态添加到缓存中，并返回当前层的完整缓存
+        用于后续的注意力计算。支持批量处理和增量更新。
+        
+        Args:
+            new_k_cache (torch.Tensor): 新的key状态，形状为[bsz, num_kv_heads, seq_len, head_dim]
+            new_v_cache (torch.Tensor): 新的value状态，形状为[bsz, num_kv_heads, seq_len, head_dim]
+            layer_idx (int): 目标层的索引
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: 返回更新后的完整key和value缓存
+        """
 
+        # 获取输入张量的维度信息
         bsz, _, incoming, _ = new_v_cache.shape  # [bsz, num_kv_heads, incoming, head_dim]
 
         # 如果一次性写入完整 batch，则需要重置 prefilled_batch
@@ -86,6 +101,7 @@ class KV_Cache:
             self.prefilled_batch = 0
 
         # 将新的 key/value 片段拷贝到缓存的连续位置
+        # 使用 prefilled_batch 来跟踪当前批次中已处理的样本数
         self.k_cache[layer_idx][
             self.prefilled_batch:self.prefilled_batch + bsz,
             :,
@@ -107,6 +123,7 @@ class KV_Cache:
             value = value.to(self.device)
 
         # 更新偏移量。只有在所有层都写入后才增加 kv_offset
+        # 这确保了所有层的缓存状态保持同步
         if layer_idx == self.num_layers - 1:
             self.prefilled_batch += bsz
             if self.prefilled_batch == self.batch_size:
@@ -136,7 +153,16 @@ class KV_Cache:
         return self.kv_offset
 
 class ShadowKVCache:
-    """ShadowKV 稀疏缓存的 GPU 参考实现"""
+    """
+    ShadowKV 稀疏缓存的 GPU 参考实现
+    
+    ShadowKV通过稀疏注意力机制大幅减少KV缓存的内存占用，同时保持模型性能。
+    主要特点包括：
+    1. 基于chunk的稀疏选择策略
+    2. SVD分解用于key状态的低秩近似
+    3. Landmark机制用于高效的相似性检索
+    4. 支持动态的KV缓存管理
+    """
     def __init__(self, 
         config :object,
         batch_size :int = 1,
@@ -147,6 +173,19 @@ class ShadowKVCache:
         chunk_size=8,
         rank=160,
         ) -> None:
+        """
+        初始化ShadowKV稀疏缓存
+        
+        Args:
+            config (object): 模型配置对象，包含层数、注意力头数等信息
+            batch_size (int): 批次大小，当前实现仅支持batch_size=1
+            max_length (int): 支持的最大序列长度，默认32K
+            device (str): 计算设备，默认'cuda:0'
+            dtype: 张量数据类型，默认torch.bfloat16
+            sparse_budget (int): 稀疏预算，即保留的token数量，默认2048
+            chunk_size (int): chunk大小，用于分块处理，默认8
+            rank (int): SVD分解的秩，用于低秩近似，默认160
+        """
         
         # 基础配置信息
         self.config = config
@@ -160,14 +199,16 @@ class ShadowKVCache:
         self.num_key_value_heads = config.num_key_value_heads
 
         # ShadowKV 参数设置
-        self.sparse_budget = int(sparse_budget)
-        self.chunk_size = chunk_size
-        self.rank = rank
-        self.local_chunk = 4
-        self.outlier_chunk = 48
+        self.sparse_budget = int(sparse_budget)  # 稀疏预算：保留的token总数
+        self.chunk_size = chunk_size             # chunk大小：分块处理的基本单位
+        self.rank = rank                         # SVD分解的秩：控制低秩近似的精度
+        self.local_chunk = 4                     # 本地chunk数：保留最近的chunk数量
+        self.outlier_chunk = 48                  # 异常值chunk数：用于处理特殊情况
 
+        # 当前实现仅支持单样本推理
         assert self.batch_size == 1, "ShadowKV class only supports batch_size=1, please use ShadowKV_CPU class for batch_size > 1"
 
+        # 选中的chunk索引，用于记录哪些chunk被保留在稀疏缓存中
         self.selected_chunk_idx = torch.zeros(
             config.num_hidden_layers,
             batch_size,
@@ -177,6 +218,7 @@ class ShadowKVCache:
             dtype=torch.long
         )
 
+        # 完整的value缓存，存储所有的value状态
         self.v_cache_cpu = torch.zeros(
             config.num_hidden_layers,
             batch_size,
@@ -187,16 +229,18 @@ class ShadowKVCache:
             dtype=self.dtype
         )
 
+        # 稀疏key缓存缓冲区，只存储选中的key状态
         self.k_cache_buffer = torch.zeros(
             config.num_hidden_layers,
             batch_size,
             config.num_key_value_heads,
-            self.sparse_budget + 4096,
+            self.sparse_budget + 4096,  # 额外的4096用于处理边界情况
             self.config.hidden_size // self.config.num_attention_heads,
             device=self.device,
             dtype=self.dtype
         )
 
+        # 稀疏value缓存缓冲区，与key缓存对应
         self.v_cache_buffer = torch.zeros(
             config.num_hidden_layers,
             batch_size,
@@ -208,50 +252,92 @@ class ShadowKVCache:
         )
 
 
-        self.num_layers = config.num_hidden_layers
-        self.kv_offset = 0
-        self.prefill = 0
-        self.gen_offset = 0
+        # 模型结构和状态信息
+        self.num_layers = config.num_hidden_layers  # 模型层数
+        self.kv_offset = 0                          # 当前缓存的序列长度
+        self.prefill = 0                            # 预填充阶段的序列长度
+        self.gen_offset = 0                         # 生成阶段的偏移量
 
-        self.k_landmark = None
-        self.k_landmark_idx = None
-        self.U = None
-        self.SV = None
+        # SVD分解相关的缓存，用于key状态的低秩近似
+        self.k_landmark = None      # landmark key状态，用于相似性检索
+        self.k_landmark_idx = None  # landmark对应的位置索引
+        self.U = None              # SVD分解的U矩阵（左奇异向量）
+        self.SV = None             # SVD分解的S*V矩阵（奇异值与右奇异向量的乘积）
 
+        # CUDA流，用于异步内存拷贝操作
         self.copy_stream = torch.cuda.Stream()
 
     def print_stats(self):
+        """
+        打印ShadowKV缓存的统计信息
+        
+        输出包括稀疏预算、chunk大小、SVD秩、已缓存长度等关键参数
+        """
         print(f"ShadowKV | sparse budget {self.sparse_budget} | chunk size {self.chunk_size} |rank {self.rank} | cached {self.kv_offset} | local_chunk {self.local_chunk} | outlier_chunk {self.outlier_chunk}")
 
     def get_svd(self, new_k_cache, layer_idx):
-        """对输入的 Key 片段做 SVD 分解并缓存，用于后续稀疏重建"""
+        """
+        对输入的Key片段进行SVD分解并缓存
+        
+        SVD分解用于将高维的key状态压缩为低秩表示，从而减少内存占用
+        同时保持足够的信息用于后续的注意力计算。
+        
+        Args:
+            new_k_cache (torch.Tensor): 新的key状态，可能的形状：
+                - [bsz, num_kv_heads, seq_len, head_dim] 或
+                - [bsz, seq_len, hidden_size]
+            layer_idx (int): 当前处理的层索引
+        """
+        # 处理不同形状的key缓存输入
         # new_k_cache 形状可为 [bsz, 8, prefill, 128] 或 [bsz, prefill, 1024]
         if new_k_cache.shape[1] <= 32:
-            # [bsz, 8, prefill, 128] --> [bsz, prefill, 1024]
+            # 多头格式：[bsz, num_kv_heads, seq_len, head_dim] --> [bsz, seq_len, hidden_size]
             k_cache = new_k_cache.transpose(1, 2).reshape(self.batch_size, -1, self.num_key_value_heads*self.head_dim)
         else:
-            # [bsz, prefill, 1024]
+            # 已经是合并格式：[bsz, seq_len, hidden_size]
             k_cache = new_k_cache
         
+        # 在第一层初始化SVD分解的存储空间
         if layer_idx == 0:
-            # init U, SV
+            # 初始化U矩阵（左奇异向量）和SV矩阵（奇异值×右奇异向量）
             self.U = torch.zeros(self.num_layers, self.batch_size, k_cache.shape[1], self.rank, device=self.device, dtype=self.dtype)
             self.SV = torch.zeros(self.num_layers, self.batch_size, self.num_key_value_heads, self.rank, self.head_dim, device=self.device, dtype=self.dtype)
         
+        # 执行SVD分解：K = U * S * V^T
         u, s, v = torch.svd(k_cache.float())
-        v = v.transpose(1,2)
-        # [bsz, 128k, 1024] --> [bsz, 128k, 160] [bsz, 160, 1024] (bsz, 8, 160, 128)
-        self.U[layer_idx].copy_(u[:, :, :self.rank].to(self.dtype)) # [bsz, 128k, 160]
-        self.SV[layer_idx].copy_(torch.matmul(torch.diag_embed(s[:, :self.rank]), v[:, :self.rank]).to(self.dtype).view(self.batch_size, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)) # [bsz, 8, 160, 128]
+        v = v.transpose(1,2)  # 转置V矩阵以便后续计算
+        
+        # 保存低秩分解结果
+        # U: [bsz, seq_len, rank] - 左奇异向量的前rank列
+        self.U[layer_idx].copy_(u[:, :, :self.rank].to(self.dtype))
+        
+        # SV: [bsz, num_kv_heads, rank, head_dim] - 奇异值与右奇异向量的乘积
+        # 这样可以通过 U @ SV 重构原始的key状态
+        sv_matrix = torch.matmul(torch.diag_embed(s[:, :self.rank]), v[:, :self.rank]).to(self.dtype)
+        self.SV[layer_idx].copy_(sv_matrix.view(self.batch_size, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2))
     
     def register_k_landmark(self, k_landmark, k_landmark_idx, layer_idx):
-        """注册 landmark，用于后续检索"""
+        """
+        注册landmark用于后续的相似性检索
+        
+        Landmark是从每个chunk中提取的代表性key状态，用于快速计算
+        query与各个chunk的相似性，从而决定哪些chunk应该被保留。
+        
+        Args:
+            k_landmark (torch.Tensor): landmark key状态，形状为[bsz, num_kv_heads, num_chunks, head_dim]
+            k_landmark_idx (torch.Tensor): landmark对应的位置索引，形状为[bsz, num_kv_heads, num_chunks]
+            layer_idx (int): 当前处理的层索引
+        """
         num_landmarks = k_landmark.shape[-2]
+        
+        # 在第一层初始化landmark存储空间
         if layer_idx == 0:
-            # init k_landmark, k_landmark_idx
+            # 初始化landmark key状态存储
             self.k_landmark = torch.zeros(self.num_layers, self.batch_size, self.num_key_value_heads, num_landmarks, self.head_dim, device=self.device, dtype=self.dtype)
+            # 初始化landmark位置索引存储
             self.k_landmark_idx = torch.zeros(self.num_layers, self.batch_size, self.num_key_value_heads, num_landmarks, device=self.device, dtype=torch.long)
         
+        # 保存当前层的landmark信息
         self.k_landmark[layer_idx].copy_(k_landmark.contiguous())
         self.k_landmark_idx[layer_idx].copy_(k_landmark_idx.contiguous())
 
@@ -261,7 +347,21 @@ class ShadowKVCache:
             key_states_roped: torch.Tensor,
             query: torch.Tensor=None
             ):
-        """在前缀阶段将初始的 KV 写入缓存并计算 landmark"""
+        """
+        在预填充阶段初始化KV缓存并计算landmark
+        
+        这是ShadowKV的核心方法之一，负责：
+        1. 将完整的value状态存储到CPU缓存
+        2. 计算chunk划分和稀疏选择参数
+        3. 存储本地chunk到GPU缓存
+        4. 计算每个chunk的landmark用于后续检索
+        
+        Args:
+            new_v_cache (torch.Tensor): 新的value状态，形状为[bsz, num_kv_heads, seq_len, head_dim]
+            layer_idx (int): 当前处理的层索引
+            key_states_roped (torch.Tensor): 应用RoPE后的key状态
+            query (torch.Tensor, optional): 查询状态，用于某些优化策略
+        """
 
         incoming = new_v_cache.shape[-2]  # [bsz, num_kv_heads, incoming, head_dim]
         self.prefill = incoming

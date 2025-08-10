@@ -17,6 +17,20 @@
 ################################################################################
 */
 
+/**
+ * @file gather_copy.cu
+ * @brief ShadowKV 稀疏注意力的 Gather-Copy 内核实现
+ * 
+ * 本文件实现了 ShadowKV 稀疏注意力机制中的核心 gather-copy 操作，
+ * 主要功能包括：
+ * 1. 基础的 gather-copy：从 CPU 内存收集指定位置的数据到 GPU
+ * 2. GPU 间的 gather-copy：在 GPU 内存中进行高效的数据重排
+ * 3. 带偏移量的优化版本：使用预计算偏移量提高内存访问效率
+ * 4. 位置 ID 重排序：为后续操作优化数据布局
+ * 
+ * 这些操作是 ShadowKV 实现稀疏注意力的关键，通过只收集和计算
+ * 重要的 KV 对，大幅减少内存使用和计算量。
+ */
 
 #include <torch/extension.h>
 #include <cuda_bf16.h>
@@ -26,8 +40,10 @@
 #include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 
+// 排序偏移量标志，用于控制排序行为
 #define SORT_OFFSET 1
 
+// 默认块大小定义，影响内核的并行度和内存访问模式
 #ifndef BLOCK_SIZE_CP
 #define BLOCK_SIZE_CP 128
 #endif
@@ -36,23 +52,44 @@
 #include "functions.h"
 #include "map.cuh"
 
+// 根据块大小选择合适的数据类型，优化内存访问
+// 128 线程块使用 int4（16字节），256 线程块使用 int2（8字节）
 #if BLOCK_SIZE_CP == 128
-#define PTYPE int4
+#define PTYPE int4  // 16字节向量化访问，适合较小的线程块
 #endif
 
 #if BLOCK_SIZE_CP == 256
-#define PTYPE int2
+#define PTYPE int2  // 8字节向量化访问，适合较大的线程块
 #endif
 
+/**
+ * @brief 基础的 Gather-Copy 操作实现
+ * 
+ * 从 CPU 内存中根据位置 ID 收集 value 数据到 GPU 缓存中。
+ * 这是 ShadowKV 稀疏注意力的核心操作，通过只收集重要的数据
+ * 来减少内存使用和提高计算效率。
+ * 
+ * @param values CPU 上的 value 张量（BFloat16 格式）
+ * @param v_cache_buffer GPU 上的 value 缓存缓冲区（BFloat16 格式）
+ * @param position_ids 位置 ID 张量，指定要收集的数据位置
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param cpu_v_length CPU 上 value 的长度
+ * @param gpu_v_length GPU 上 value 缓存的长度
+ * @param map_size 映射表大小，默认为 256
+ */
 void gather_copy(
     torch::Tensor values, torch::Tensor v_cache_buffer, torch::Tensor position_ids,
     int batch_size, int heads, int cpu_v_length, int gpu_v_length, int map_size = 256)
 {
-    int blockSize = BLOCK_SIZE_CP;
-    int numBlocks = batch_size * heads;
-    int maxSMBytes = CPY_SIZE*2*1024 + map_size*4; // must less than 160 KB
+    // 设置 CUDA 内核参数
+    int blockSize = BLOCK_SIZE_CP;  // 每个线程块的线程数
+    int numBlocks = batch_size * heads;  // 线程块总数，每个注意力头一个块
+    
+    // 计算共享内存需求：复制缓冲区 + 映射表，必须小于 160KB
+    int maxSMBytes = CPY_SIZE*2*1024 + map_size*4;
 
-    // Cast bf16 data pointers to int2 or int4
+    // 将 BFloat16 数据指针转换为向量化类型指针，提高内存访问效率
     PTYPE* values_ptr = reinterpret_cast<PTYPE*>(values.data_ptr<at::BFloat16>());
     PTYPE* v_cache_buffer_ptr = reinterpret_cast<PTYPE*>(v_cache_buffer.data_ptr<at::BFloat16>());
 
