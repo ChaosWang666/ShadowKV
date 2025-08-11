@@ -145,22 +145,40 @@ void gather_copy(
     }
 }
 
-/// for keys
+/**
+ * @brief GPU 到 GPU 的 Key 数据 Gather-Copy 操作
+ * 
+ * 在 GPU 内存中进行高效的 key 数据收集和重排，使用预计算的偏移量
+ * 来优化内存访问模式。该函数专门用于 key 张量的设备间拷贝，
+ * 支持 ShadowKV 稀疏注意力中的动态 key 选择。
+ * 
+ * @param keys GPU 上的 key 张量（BFloat16 格式）
+ * @param offsets 预计算的偏移量数组，由 reorder_keys_and_compute_offsets 计算
+ * @param cnts 计数数组，用于分离 D2D 和 H2D 操作
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param gpu_v_length GPU 上数据的长度
+ * @param gpu_v_offset GPU 数据的起始偏移量
+ * @param gpu_v_stride GPU 数据的内存步长
+ * @param map_size 映射表大小，默认为 256
+ */
 void gather_copy_d2d_with_offsets(
     torch::Tensor keys, 
-    torch::Tensor offsets,          // input, offsets computed from reorder_keys_and_compute_offsets, size as elements (numBlocks*256)
-    torch::Tensor cnts,             // input, counts computed from reorder_keys_and_compute_offsets, size as numBlocks
+    torch::Tensor offsets,          // 输入：预计算的偏移量数组 (numBlocks*256)
+    torch::Tensor cnts,             // 输入：计数数组 (numBlocks)
     int batch_size, int heads, 
     int gpu_v_length, 
     int gpu_v_offset, 
     int gpu_v_stride, 
     int map_size = 256)
 {
-    int blockSize = BLOCK_SIZE_CP;
-    int numBlocks = batch_size * heads;
-    int maxSMBytes = CPY_SIZE*2*1024 + map_size*4 + sizeof(PTYPE); // must less than 160 KB
+    // 设置 CUDA 内核参数
+    int blockSize = BLOCK_SIZE_CP;  // 每个线程块的线程数
+    int numBlocks = batch_size * heads;  // 线程块总数
+    // 计算共享内存需求：复制缓冲区 + 映射表 + 额外空间，必须小于 160KB
+    int maxSMBytes = CPY_SIZE*2*1024 + map_size*4 + sizeof(PTYPE);
 
-    // Cast bf16 data pointers to int2 or int4
+    // 将 BFloat16 数据指针转换为向量化类型指针，提高内存访问效率
     PTYPE* keys_ptr = reinterpret_cast<PTYPE*>(keys.data_ptr<at::BFloat16>());
     int* offsets_ptr = reinterpret_cast<int*>(offsets.data_ptr<int32_t>());
     int* cnts_ptr = reinterpret_cast<int*>(cnts.data_ptr<int32_t>());
@@ -221,19 +239,36 @@ void gather_copy_d2d_with_offsets(
     }
 }
 
-// reorder position ids, and compute offsets and cnts by computing cache hits/misses
-// call it before gather_copy_with_offsets
+/**
+ * @brief 重排序位置 ID 并计算偏移量和计数
+ * 
+ * 通过计算缓存命中/未命中来重排序位置 ID，并计算用于后续
+ * gather_copy_with_offsets 操作的偏移量和计数。这是 ShadowKV
+ * 稀疏注意力中的关键预处理步骤，确保高效的数据收集。
+ * 
+ * 必须在调用 gather_copy_with_offsets 之前调用此函数。
+ * 
+ * @param cached_pos_ids 缓存的位置 ID（输入输出，int64_t 类型）
+ * @param cur_pos_ids 当前传入的位置 ID（输入，int64_t 类型）
+ * @param offsets 输出的偏移量数组，用于 gather_copy_with_offsets
+ * @param cnts 输出的计数数组，用于分离 D2D 和 H2D 操作
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param map_size 映射表大小，默认为 256
+ */
 void reorder_keys_and_compute_offsets(
-    torch::Tensor cached_pos_ids, // inout, as cached previous position id as input, also reordered position ids, int64_t type
-    torch::Tensor cur_pos_ids,    // input, incoming position id, int64_t type
-    torch::Tensor offsets,        // output, offsets for gather_copy_with_offsets, size as numBlocks, int type
-    torch::Tensor cnts,           // output, counts to separate d2d and h2d, size as numBlocks, int type
+    torch::Tensor cached_pos_ids, // 输入输出：缓存的位置 ID，同时作为重排序后的位置 ID 输出
+    torch::Tensor cur_pos_ids,    // 输入：当前传入的位置 ID (int64_t)
+    torch::Tensor offsets,        // 输出：用于 gather_copy_with_offsets 的偏移量数组 (int)
+    torch::Tensor cnts,           // 输出：用于分离 D2D 和 H2D 操作的计数数组 (int)
     int batch_size, int heads, 
     int map_size = 256)
 {
-    int blockSize = map_size;
-    int numBlocks = batch_size * heads;
+    // 设置 CUDA 内核参数：每个线程块处理一个映射表
+    int blockSize = map_size;  // 线程块大小等于映射表大小
+    int numBlocks = batch_size * heads;  // 线程块总数
 
+    // 获取数据指针
     int64_t* cached_pos = cached_pos_ids.data_ptr<int64_t>();
     int64_t* cur_pos = cur_pos_ids.data_ptr<int64_t>();
     int* offsets_ptr = reinterpret_cast<int*>(offsets.data_ptr<int32_t>());
@@ -271,22 +306,45 @@ void reorder_keys_and_compute_offsets(
     }
 }
 
-// gather copy with offsets
-// call it after reorder_keys_and_compute_offsets
+/**
+ * @brief 带偏移量的 Gather-Copy 操作
+ * 
+ * 使用预计算的偏移量进行高效的 value 数据收集，支持 CPU 到 GPU
+ * 的异步数据传输。这是 ShadowKV 中最重要的内存优化操作之一，
+ * 实现了稀疏注意力中的核心数据收集逻辑。
+ * 
+ * 必须在调用 reorder_keys_and_compute_offsets 之后调用此函数。
+ * 
+ * @param values CPU 上的 value 张量（BFloat16 格式）
+ * @param v_cache_buffer GPU 上的 value 缓存缓冲区（输入输出）
+ * @param temp 临时 GPU 内存，大小与单层 v_cache_buffer 相同
+ * @param offsets 预计算的偏移量数组，由 reorder_keys_and_compute_offsets 计算
+ * @param cnts 计数数组，由 reorder_keys_and_compute_offsets 计算
+ * @param signals 内部信号数组，全零初始化
+ * @param batch_size 批次大小
+ * @param heads 注意力头数
+ * @param cpu_v_length CPU 上 value 的长度
+ * @param gpu_v_length GPU 上 value 缓存的长度
+ * @param gpu_v_offset GPU value 缓存的起始偏移量
+ * @param gpu_v_stride GPU value 缓存的内存步长
+ * @param map_size 映射表大小，默认为 256
+ */
 void gather_copy_with_offsets(
-    torch::Tensor values,           // input, cpu values
-    torch::Tensor v_cache_buffer,   // inout, gpu values
-    torch::Tensor temp,             // a temp gpu memory for copy, size same as single layer v_cache_buffer 
-    torch::Tensor offsets,          // input, offsets computed from reorder_keys_and_compute_offsets, size as elements (numBlocks*256)
-    torch::Tensor cnts,             // input, counts computed from reorder_keys_and_compute_offsets, size as numBlocks
-    torch::Tensor signals,          // extra internal signals, all zeros sizes as numBlocks, size as numBlocks
-    int batch_size, int heads, int cpu_v_length, int gpu_v_length, int gpu_v_offset, int gpu_v_stride, int map_size = 256) // input, torch stream
+    torch::Tensor values,           // 输入：CPU 上的 value 张量
+    torch::Tensor v_cache_buffer,   // 输入输出：GPU 上的 value 缓存缓冲区
+    torch::Tensor temp,             // 临时 GPU 内存，大小与单层 v_cache_buffer 相同
+    torch::Tensor offsets,          // 输入：预计算的偏移量数组 (numBlocks*256)
+    torch::Tensor cnts,             // 输入：计数数组 (numBlocks)
+    torch::Tensor signals,          // 内部信号数组，全零初始化 (numBlocks)
+    int batch_size, int heads, int cpu_v_length, int gpu_v_length, int gpu_v_offset, int gpu_v_stride, int map_size = 256)
 {
-    int blockSize = BLOCK_SIZE_CP;
-    int numBlocks = batch_size * heads * 2; // numBlocksBP = 2 * BLOCK_NUM
-    int maxSMBytes = CPY_SIZE * 2 * 1024 + map_size * 4 + sizeof(PTYPE); // must less than 160 KB
+    // 设置 CUDA 内核参数
+    int blockSize = BLOCK_SIZE_CP;  // 每个线程块的线程数
+    int numBlocks = batch_size * heads * 2; // 线程块总数，使用双缓冲策略
+    // 计算共享内存需求：复制缓冲区 + 映射表 + 额外空间，必须小于 160KB
+    int maxSMBytes = CPY_SIZE * 2 * 1024 + map_size * 4 + sizeof(PTYPE);
 
-    // Cast bf16 data pointers to int2 or int4
+    // 将 BFloat16 数据指针转换为向量化类型指针，提高内存访问效率
     PTYPE* values_ptr = reinterpret_cast<PTYPE*>(values.data_ptr<at::BFloat16>());
     PTYPE* v_cache_buffer_ptr = reinterpret_cast<PTYPE*>(v_cache_buffer.data_ptr<at::BFloat16>());
     PTYPE* temp_ptr = reinterpret_cast<PTYPE*>(temp.data_ptr<at::BFloat16>());
@@ -294,7 +352,7 @@ void gather_copy_with_offsets(
     int* cnts_ptr = reinterpret_cast<int*>(cnts.data_ptr<int32_t>());
     unsigned int* signals_ptr = reinterpret_cast<unsigned int*>(signals.data_ptr<int32_t>());
     
-    // Get cudaStream_t from torch::cuda::Stream
+    // 获取当前 CUDA 流，支持异步操作
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if(map_size == 256) {

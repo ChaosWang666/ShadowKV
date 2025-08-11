@@ -24,11 +24,36 @@
  *CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
  *SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
  *INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- *CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
  *ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  *POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+
+/**
+ * @file batch_gemm_softmax.h
+ * @brief ShadowKV 批量 GEMM+Softmax 融合操作头文件
+ * 
+ * 本文件定义了 ShadowKV 稀疏注意力机制中的核心计算组件，实现了高效的
+ * 批量矩阵乘法和 Softmax 归一化融合操作。主要包含：
+ * 
+ * 1. **ApplySoftmax 内核**：执行数值稳定的 Softmax 计算
+ * 2. **BatchGemmSoftmax 类**：融合 GEMM 和 Softmax 的完整操作
+ * 3. **模板化设计**：支持多种数据类型和计算精度配置
+ * 4. **CUTLASS 集成**：利用 NVIDIA CUTLASS 库的高性能 GEMM 实现
+ * 
+ * 核心优势：
+ * - 减少内存带宽需求：避免中间结果的全局内存读写
+ * - 数值稳定性：使用 max-subtraction 技术防止 Softmax 溢出
+ * - 高性能计算：利用 Tensor Core 加速矩阵运算
+ * - 批量处理：支持多头注意力的并行计算
+ * 
+ * 适用场景：
+ * - Transformer 模型的注意力权重计算
+ * - ShadowKV 稀疏注意力机制
+ * - 大规模语言模型推理优化
+ */
+
 #pragma once
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -56,10 +81,31 @@
 namespace cutlass {
 
 namespace kernel {
-//
-// Kernel computes partial reduction
-// Sum[m, n'] = sum_n(exp(D[m, n] - N[m, 0]))
-//
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @class ApplySoftmax
+ * @brief 数值稳定的 Softmax 应用内核
+ * 
+ * 本类实现了高效且数值稳定的 Softmax 计算，是 ShadowKV 注意力权重归一化的核心组件。
+ * 采用经典的 max-subtraction 技术确保计算的数值稳定性，避免指数函数溢出。
+ * 
+ * 计算流程：
+ * 1. 读取 GEMM 输出矩阵 D (Query × Key^T 结果)
+ * 2. 读取预计算的归一化因子 N (每行最大值)
+ * 3. 读取预计算的行和 S (exp(x - max) 的行和)
+ * 4. 计算最终 Softmax：softmax(x) = exp(x - max) / sum
+ * 
+ * 模板参数说明：
+ * @tparam ElementD_ GEMM 输出矩阵的数据类型 (通常为 bfloat16)
+ * @tparam ElementNorm_ 归一化因子的数据类型 (通常为 float)
+ * @tparam ElementSum_ 行和的数据类型 (通常为 float)
+ * @tparam ElementSoft_ Softmax 输出的数据类型 (通常为 bfloat16)
+ * @tparam ElementSoftmaxCompute_ Softmax 内部计算精度 (通常为 float)
+ * @tparam Alignment 内存对齐要求 (优化内存访问性能)
+ * @tparam ApplyShape_ 处理形状 (默认 1×1024，表示每次处理 1 行最多 1024 个元素)
+ */
 template <typename ElementD_, typename ElementNorm_, typename ElementSum_,
           typename ElementSoft_, typename ElementSoftmaxCompute_, int Alignment,
           typename ApplyShape_ = MatrixShape<1, 1024>>
@@ -83,22 +129,25 @@ public:
 
   using FragmentSoftmax = Array<ElementSoftmaxCompute, kAlignment>;
 
-  //
-  // Arguments
-  //
-
+  /**
+   * @struct Arguments
+   * @brief ApplySoftmax 内核的参数配置结构
+   * 
+   * 包含执行 Softmax 计算所需的所有输入输出张量引用和批量处理配置。
+   * 支持批量处理多个注意力头的并行计算。
+   */
   struct Arguments {
 
-    MatrixCoord extent;        ///< Extent of D and Softmax matrices
-    int batch_count;           ///< Batch count
-    TensorRefD ref_D;          ///< D matrix computed by GEMM+Max (input)
-    TensorRefN ref_N;          ///< Norm tensor (input)
-    TensorRefSum ref_S;        ///< Sum  tensor (input)
-    TensorRefSoft ref_Soft;    ///< Softmax tensor (output)
-    int64_t batch_stride_D;    ///< Batch stride for D tensor
-    int64_t batch_stride_N;    ///< Batch stride for N tensor
-    int64_t batch_stride_S;    ///< Batch stride for S tensor
-    int64_t batch_stride_Soft; ///< Batch stride for softmax tensor
+    MatrixCoord extent;        ///< D 和 Softmax 矩阵的尺寸 (m × n)
+    int batch_count;           ///< 批量大小 (注意力头数量)
+    TensorRefD ref_D;          ///< GEMM+Max 计算结果矩阵 D (输入)
+    TensorRefN ref_N;          ///< 归一化因子张量 N (输入，每行最大值)
+    TensorRefSum ref_S;        ///< 行和张量 S (输入，exp(x-max) 的行和)
+    TensorRefSoft ref_Soft;    ///< Softmax 输出张量 (输出)
+    int64_t batch_stride_D;    ///< D 张量的批量步长
+    int64_t batch_stride_N;    ///< N 张量的批量步长
+    int64_t batch_stride_S;    ///< S 张量的批量步长
+    int64_t batch_stride_Soft; ///< Softmax 张量的批量步长
 
     //
     // Methods
@@ -255,7 +304,52 @@ private:
 
 } // namespace kernel
 
-///
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @class BatchGemmSoftmax
+ * @brief ShadowKV 批量 GEMM+Softmax 融合操作的主类
+ * 
+ * 本类是 ShadowKV 稀疏注意力机制的核心计算组件，实现了高效的批量矩阵乘法
+ * 和 Softmax 归一化融合操作。通过将多个计算步骤融合在一起，显著减少了
+ * 内存访问开销并提高了计算效率。
+ * 
+ * 主要功能：
+ * 1. **批量 GEMM 计算**：执行 Query × Key^T 矩阵乘法
+ * 2. **温度缩放**：应用注意力温度参数进行缩放
+ * 3. **数值稳定 Softmax**：计算注意力权重的归一化
+ * 4. **统计量输出**：提供最大值和行和用于后续计算
+ * 
+ * 性能优化特性：
+ * - 利用 CUTLASS 库的高性能 GEMM 实现
+ * - 使用 Tensor Core 加速矩阵运算
+ * - 融合计算减少内存带宽需求
+ * - 支持多种数据类型和精度配置
+ * - 优化的线程块和 Warp 配置
+ * 
+ * 模板参数说明：
+ * @tparam ElementA_ Query 矩阵数据类型
+ * @tparam LayoutA_ Query 矩阵内存布局
+ * @tparam ElementB_ Key 矩阵数据类型
+ * @tparam LayoutB_ Key 矩阵内存布局
+ * @tparam ElementC_ 输出矩阵数据类型
+ * @tparam ElementCompute_ GEMM 计算精度
+ * @tparam OperatorClass_ 计算类型 (TensorOp/SIMT)
+ * @tparam ArchTag_ 目标 GPU 架构
+ * @tparam ThreadblockShape_ 线程块瓦片形状
+ * @tparam WarpShape_ Warp 瓦片形状
+ * @tparam InstructionShape_ 指令瓦片形状
+ * @tparam EpilogueFunctorOp_ Epilogue 函数操作
+ * @tparam kStages_ 流水线阶段数
+ * @tparam ApplyShape_ Softmax 应用形状
+ * @tparam AlignmentA_ Query 矩阵内存对齐
+ * @tparam AlignmentB_ Key 矩阵内存对齐
+ * @tparam AlignmentSoftmax_ Softmax 内存对齐
+ * @tparam ElementNorm_ 归一化因子数据类型
+ * @tparam ElementSum_ 行和数据类型
+ * @tparam ElementSoftmax_ Softmax 输出数据类型
+ * @tparam ElementSoftmaxCompute_ Softmax 计算精度
+ */
 template <typename ElementA_, typename LayoutA_, typename ElementB_,
           typename LayoutB_, typename ElementC_, typename ElementCompute_,
           typename OperatorClass_, typename ArchTag_,
