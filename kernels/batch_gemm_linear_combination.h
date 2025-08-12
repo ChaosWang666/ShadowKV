@@ -30,6 +30,24 @@
  **************************************************************************************************/
 /*! \file
   \brief Functor performing linear combination operations used by epilogues.
+  \brief 执行 epilogue 中线性组合操作的函数对象
+  
+  中文详细说明：
+  这个文件实现了 ShadowKV 项目中批量 GEMM 操作的线性组合功能。
+  线性组合是 GEMM epilogue 阶段的核心操作，负责将累加器结果转换为最终输出。
+  
+  主要功能：
+  1. 标准线性组合：D = alpha * accumulator + beta * C
+  2. 批量操作支持：为每个批次提供独立的 alpha/beta 参数
+  3. 按通道缩放：支持每个通道独立的缩放因子
+  4. 数值转换：支持不同精度间的安全转换
+  5. 内存优化：减少中间结果的内存占用
+  
+  性能特点：
+  - 向量化操作：一次处理多个元素
+  - 融合计算：减少内存访问次数
+  - 数值稳定性：支持多种舍入模式
+  - 灵活的参数传递：支持常量、指针和数组形式的参数
 */
 
 #pragma once
@@ -54,47 +72,76 @@ namespace thread {
 ///
 /// D = alpha * accumulator + beta * source
 ///
+/**
+ * @brief 批量 GEMM 线性组合操作类
+ * 
+ * 这个类实现了 ShadowKV 稀疏注意力机制中的核心线性组合操作。
+ * 它负责将 GEMM 累加器的结果转换为最终的输出格式。
+ * 
+ * 数学公式：D = alpha * accumulator + beta * C
+ * 其中：
+ * - D: 输出张量
+ * - accumulator: GEMM 计算的累加器结果
+ * - C: 源张量（可选，用于残差连接等）
+ * - alpha, beta: 缩放因子
+ */
 template <
-  typename ElementOutput_,                             ///< Data type used to load and store tensors
-  int Count,                                           ///< Number of elements computed per operation.
-                                                       ///< Usually it is 128/sizeof_bits<ElementOutput_>,
-                                                       ///< but we use 64 or 32 sometimes when there are not enough data to store
-  typename ElementAccumulator_ = ElementOutput_,       ///< Accumulator data type
-  typename ElementCompute_ = ElementOutput_,           ///< Data type used to compute linear combination
-  ScaleType::Kind Scale = ScaleType::Default,          ///< Control Alpha and Beta scaling
-  FloatRoundStyle Round = FloatRoundStyle::round_to_nearest,
-  typename ElementSource_ = ElementOutput_
+  typename ElementOutput_,                             ///< 用于加载和存储张量的数据类型
+  int Count,                                           ///< 每次操作计算的元素数量
+                                                       ///< 通常是 128/sizeof_bits<ElementOutput_>
+                                                       ///< 但当数据不足时也使用 64 或 32
+  typename ElementAccumulator_ = ElementOutput_,       ///< 累加器数据类型
+  typename ElementCompute_ = ElementOutput_,           ///< 用于计算线性组合的数据类型
+  ScaleType::Kind Scale = ScaleType::Default,          ///< 控制 Alpha 和 Beta 缩放的类型
+  FloatRoundStyle Round = FloatRoundStyle::round_to_nearest, ///< 浮点舍入方式
+  typename ElementSource_ = ElementOutput_             ///< 源张量元素类型
 >
 class BatchGEMMLinearCombination {
 public:
 
+  /// 输出元素类型
   using ElementOutput = ElementOutput_;
+  /// 源张量元素类型
   using ElementSource = ElementSource_;
+  /// 累加器元素类型
   using ElementAccumulator = ElementAccumulator_;
+  /// 计算元素类型
   using ElementCompute = ElementCompute_;
+  /// 标量元素类型（与计算类型相同）
   using ElementScalar = ElementCompute;
+  /// C 矩阵元素类型（与源类型相同）
   using ElementC = ElementSource_;
+  /// D 矩阵元素类型（与输出类型相同）
   using ElementD = ElementOutput_;
 
+  /// 每次操作处理的元素数量
   static int const kCount = Count;
+  /// 缩放类型
   static const ScaleType::Kind kScale = Scale;
+  /// 输出片段类型
   using FragmentOutput = Array<ElementOutput, kCount>;
+  /// 源片段类型
   using FragmentSource = Array<ElementSource, kCount>;
+  /// 累加器片段类型
   using FragmentAccumulator = Array<ElementAccumulator, kCount>;
+  /// 计算片段类型
   using FragmentCompute = Array<ElementCompute, kCount>;
 
+  /// 浮点舍入方式
   static FloatRoundStyle const kRound = Round;
 
-  /// Host-constructable parameters structure
+  /// 线性组合的参数结构体
+  /// 支持多种参数传递方式：常量、指针、批量指针数组
   struct Params
   {
-    ElementCompute alpha;                         ///< scales accumulators
-    ElementCompute beta;                          ///< scales source tensor
-    ElementCompute const *alpha_ptr;              ///< pointer to accumulator scalar - if not null, loads it from memory
-    ElementCompute const *beta_ptr;               ///< pointer to source scalar - if not null, loads it from memory
-    ElementCompute const* const* alpha_ptr_array; ///< array of pointers to accumulator scalar per group/batch
-    ElementCompute const* const* beta_ptr_array;  ///< array of pointers to source scalar per group/batch
+    ElementCompute alpha;                         ///< 累加器缩放因子
+    ElementCompute beta;                          ///< 源张量缩放因子
+    ElementCompute const *alpha_ptr;              ///< 累加器标量指针 - 如果非空，从内存加载
+    ElementCompute const *beta_ptr;               ///< 源标量指针 - 如果非空，从内存加载
+    ElementCompute const* const* alpha_ptr_array; ///< 每个组/批次的累加器标量指针数组
+    ElementCompute const* const* beta_ptr_array;  ///< 每个组/批次的源标量指针数组
 
+    /// 默认构造函数：alpha=1, beta=0（仅累加器输出）
     CUTLASS_HOST_DEVICE
     Params():
       alpha(ElementCompute(1)),
@@ -104,6 +151,7 @@ public:
       alpha_ptr_array(nullptr),
       beta_ptr_array(nullptr) { }
 
+    /// 常量参数构造函数：使用固定的 alpha 和 beta 值
     CUTLASS_HOST_DEVICE
     Params(
       ElementCompute alpha,
@@ -113,6 +161,7 @@ public:
       alpha_ptr(nullptr), beta_ptr(nullptr),
       alpha_ptr_array(nullptr), beta_ptr_array(nullptr) { }
 
+    /// 仅 alpha 参数构造函数：beta 设为 0
     CUTLASS_HOST_DEVICE
     Params(
       ElementCompute alpha
@@ -158,11 +207,12 @@ public:
 
 private:
 
-  //
-  // Data members
-  //
+  /// 数据成员
+  /// 存储当前实例使用的缩放因子
 
+  /// 累加器缩放因子
   ElementCompute alpha_;
+  /// 源张量缩放因子
   ElementCompute beta_;
 
 public:

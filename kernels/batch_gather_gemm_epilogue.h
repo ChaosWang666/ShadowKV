@@ -102,25 +102,36 @@ namespace threadblock {
 
 /// GatherRopeEpilogue operator
 template <typename Shape_, ///< Shape of threadblock tile (concept: GemmShape)
+                           ///< 线程块瓦片的形状（概念：GemmShape）
           typename WarpMmaOperator_, ///< Warp-level MMA operator (concept:
                                      /// gemm::warp::MmaTensorOp)
+                                     ///< Warp 级 MMA 操作符（概念：gemm::warp::MmaTensorOp）
           int PartitionsK, ///< Number of partitions of the K dimension
+                           ///< K 维度的分区数量
           typename OutputTileIterator_, ///< Tile iterator reading and writing
                                         /// output tensors
-          typename SinCosCacheTileIterator_,
+                                        ///< 读写输出张量的瓦片迭代器
+          typename SinCosCacheTileIterator_, ///< RoPE 的 sin/cos 缓存瓦片迭代器
           typename AccumulatorFragmentIterator_, ///< Fragment iterator
                                                  /// selecting accumulators
+                                                 ///< 选择累加器的片段迭代器
           typename WarpTileIterator_,   ///< Warp-scoped tile iterator writing
                                         /// accumulators to SMEM
+                                        ///< 将累加器写入共享内存的 Warp 级瓦片迭代器
           typename SharedLoadIterator_, ///< Threadblock-scoped tile iterator
                                         /// loading from SMEM
+                                        ///< 从共享内存加载的线程块级瓦片迭代器
           typename OutputOp_,           ///< Output operator
+                                        ///< 输出操作符
           typename Padding_, ///< Padding added to SMEM allocation to avoid bank
                              /// conflicts (concept: MatrixShape)
+                             ///< 添加到共享内存分配的填充，以避免存储体冲突
           int FragmentsPerPartition =
               1,                 ///< Used to coarsten the epilogue granularity
+                                 ///< 用于粗化 epilogue 粒度
           int IterationsUnroll = ///< Used to reduce binary size when epilogue
                                  /// op is large
+                                 ///< 当 epilogue 操作较大时用于减少二进制大小
           (!IsEpilogueFunctorHeavy<OutputOp_>::value)>
 class GatherRopeEpilogue
     : public EpilogueBase<Shape_, typename WarpMmaOperator_::Shape, PartitionsK,
@@ -151,48 +162,62 @@ public:
   using LongIndex = typename Layout::LongIndex;
 
   /// Number of warps per block
+  /// 每个块的 warp 数量
   using WarpCount = typename Base::WarpCount;
 
   /// Number of threads per block
+  /// 每个块的线程数量
   static int const kBlockThreads = 32 * WarpCount::kCount;
 
   /// Per-thread accumulator tile type
+  /// 每线程累加器瓦片类型
   using AccumulatorTile = typename Base::AccumulatorTile;
 
   /// Numerical accumulation element type
+  /// 数值累加元素类型
   using ElementAccumulator = typename WarpMmaOperator::ElementC;
 
   /// Fragment type used by the accumulator tile's fragment iterator
+  /// 累加器瓦片片段迭代器使用的片段类型
   using AccumulatorFragment = typename AccumulatorFragmentIterator::Fragment;
 
   /// Output element
+  /// 输出元素类型
   using ElementOutput = typename OutputTileIterator::Element;
 
   /// Output access size
+  /// 输出访问大小
   static int const kElementsPerAccess = OutputTileIterator::kElementsPerAccess;
 
   /// Tensor reference to destination tensor
+  /// 目标张量的张量引用
   using TensorRef = typename OutputTileIterator::TensorRef;
 
   /// Tensor reference to sync tensor
+  /// 同步张量的张量引用
   using SyncTensorRef =
       typename cutlass::TensorRef<int, cutlass::layout::PackedVectorLayout>;
 
   /// Const tensor reference to source tensor
+  /// 源张量的常量张量引用
   using ConstTensorRef = typename OutputTileIterator::ConstTensorRef;
 
   /// Vector type used by the global output iterator
+  /// 全局输出迭代器使用的向量类型
   using OutputAccessType = Array<typename OutputTileIterator::Element,
                                  OutputTileIterator::kElementsPerAccess>;
 
   /// Vector type used by the shared output iterator
+  /// 共享输出迭代器使用的向量类型
   using AccumulatorAccessType = Array<typename WarpTileIterator::Element,
                                       OutputTileIterator::kElementsPerAccess>;
 
+  /// 共享内存瓦片数量：根据片段迭代次数或 K 分区数确定
   static int constexpr kSmemTiles = Base::kFragmentsPerIteration > 1
                                         ? Base::kFragmentsPerIteration
                                         : kPartitionsK;
 
+  /// 共享内存指针偏移量：用于在不同瓦片间进行内存分配
   static int constexpr kSmemPointerOffset =
       Base::SharedStorage::StorageShape::kCount / kSmemTiles;
 
@@ -213,17 +238,19 @@ public:
                 "One of these must be exactly 1.");
 
 public:
-  /// Aspect for when epilogue source is not needed
+  /// 当 epilogue 不需要源数据时的处理方式
+  /// 用于只需要累加器数据进行输出操作的场景
   struct SourceAspectNotNeeded {
-    /// Constructor
+    /// 构造函数
     CUTLASS_DEVICE
     SourceAspectNotNeeded() {}
 
-    // No-op
+    /// 空操作 - 不需要加载源数据
     CUTLASS_DEVICE
     void load() {}
 
-    /// Invoke the output functor over each vector of output
+    /// 对输出的每个向量调用输出函数
+    /// 仅使用累加器数据进行输出操作，不涉及源数据
     CUTLASS_DEVICE
     void apply_output_operator(
         typename OutputTileIterator::Fragment &output_fragment,
@@ -247,13 +274,17 @@ public:
     }
   };
 
-  /// Aspect for when epilogue source is needed
+  /// 当 epilogue 需要源数据时的处理方式
+  /// 用于需要累加器数据和源数据进行融合操作的场景（如残差连接）
   struct SourceAspectNeeded {
+    /// 源数据瓦片迭代器
     OutputTileIterator source_iterator;
 
+    /// 源数据片段缓存
     typename OutputTileIterator::Fragment source_fragment;
 
-    /// Invoke the output functor over each vector of output
+    /// 对输出的每个向量调用输出函数（静态版本）
+    /// 同时使用累加器数据和源数据进行输出操作
     CUTLASS_DEVICE
     static void apply_output_operator(
         typename OutputTileIterator::Fragment &output_fragment,
@@ -280,21 +311,24 @@ public:
       }
     }
 
-    /// Constructor
+    /// 构造函数
+    /// @param source_iterator 源数据瓦片迭代器
     CUTLASS_DEVICE
     SourceAspectNeeded(OutputTileIterator source_iterator)
         : source_iterator(source_iterator) {
       source_fragment.clear();
     }
 
-    // Load addend source fragment from global memory
+    /// 从全局内存加载加数源片段
+    /// 用于加载需要与累加器结果进行融合的源数据
     CUTLASS_DEVICE
     void load() {
       source_iterator.load(source_fragment);
       ++source_iterator;
     }
 
-    /// Invoke the output functor over each vector of output
+    /// 对输出的每个向量调用输出函数（实例版本）
+    /// 调用静态版本的 apply_output_operator
     CUTLASS_DEVICE
     void apply_output_operator(
         typename OutputTileIterator::Fragment &output_fragment,
@@ -306,23 +340,27 @@ public:
   };
 
 private:
-  /// Loads fragment from shared memory aligned with output tensor
+  /// 从与输出张量对齐的共享内存加载片段的迭代器
+  /// 用于高效地从共享内存读取累加器数据
   SharedLoadIterator shared_load_iterator_;
 
-  /// Thread index in the threadblock
+  /// 线程块内的线程索引
+  /// 用于确定当前线程在线程块中的位置
   int thread_idx;
 
-  /// Warp index in the threadblock
+  /// 线程块内的 warp 索引
+  /// 用于确定当前 warp 在线程块中的位置
   int warp_idx;
 
 public:
-  /// Constructor
+  /// GatherRopeEpilogue 构造函数
+  /// 初始化 ShadowKV 稀疏注意力 epilogue 的所有组件
   CUTLASS_DEVICE
   GatherRopeEpilogue(
-      typename Base::SharedStorage &shared_storage, ///< Shared storage object
-      int thread_idx, ///< ID of a thread within the threadblock
-      int warp_idx,   ///< ID of warp within threadblock
-      int lane_idx)   ///< Id of thread within warp
+      typename Base::SharedStorage &shared_storage, ///< 共享存储对象
+      int thread_idx, ///< 线程块内的线程 ID
+      int warp_idx,   ///< 线程块内的 warp ID
+      int lane_idx)   ///< warp 内的线程 ID
       : Base(shared_storage, thread_idx, warp_idx, lane_idx),
         BaseStreamK(thread_idx),
         shared_load_iterator_(shared_storage.reference(), thread_idx),

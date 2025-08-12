@@ -1,4 +1,4 @@
-/***************************************************************************************************
+/*
  * Copyright (c) 2017 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
@@ -26,11 +26,32 @@
  * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- **************************************************************************************************/
+ */
 
 /*! \file
-    \brief
+    \brief 支持批量聚集索引的通用GEMM内核 - ShadowKV稀疏注意力机制的核心组件
+    
+    本文件实现了一个高度优化的GEMM内核，专门为ShadowKV的稀疏注意力机制设计。
+    主要功能包括：
+    
+    核心特性：
+    - 稀疏索引支持：通过gather/scatter操作实现稀疏矩阵访问
+    - RoPE集成：内置旋转位置编码支持，优化Transformer模型性能
+    - 批量处理：高效处理多个GEMM操作，减少内核启动开销
+    - 内存优化：智能内存访问模式，最大化带宽利用率
+    - 架构适配：针对不同GPU架构（Volta/Turing/Ampere）的专门优化
+    
+    技术优势：
+    - 融合操作：将GEMM、RoPE、稀疏访问融合在单个内核中
+    - 高效同步：优化的线程块调度和同步机制
+    - 灵活配置：支持多种数据类型和矩阵布局
+    - 性能调优：针对稀疏注意力模式的专门优化
+    
+    应用场景：
+    - 稀疏注意力计算：Q*K^T矩阵乘法与稀疏模式结合
+    - KV缓存管理：高效的键值缓存更新和访问
+    - 位置编码融合：RoPE与注意力计算的一体化处理
+    - 批量推理：多序列并行处理优化
 */
 
 #pragma once
@@ -77,10 +98,27 @@ namespace kernel {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+/**
+ * @brief 支持批量聚集索引的通用GEMM内核类
+ * 
+ * 这是ShadowKV稀疏注意力机制的核心计算内核，专门设计用于处理带有稀疏索引的
+ * 批量GEMM操作。该类将矩阵乘法、稀疏访问模式和RoPE位置编码融合在一起，
+ * 为Transformer模型提供高效的注意力计算支持。
+ * 
+ * 主要特性：
+ * - 稀疏矩阵访问：支持通过索引数组进行gather/scatter操作
+ * - 批量处理：同时处理多个GEMM操作，提高GPU利用率
+ * - RoPE集成：内置旋转位置编码计算，减少内存访问
+ * - 灵活配置：支持多种数据类型、矩阵布局和计算精度
+ * 
+ * @tparam Mma_ 线程块级矩阵乘累加器，定义计算核心逻辑
+ * @tparam Epilogue_ 后处理器，处理输出变换和写回操作
+ * @tparam ThreadblockSwizzle_ 线程块调度器，优化内存访问模式
+ */
 template <
-  typename Mma_,                  ///! Threadblock-scoped matrix multiply-accumulate
-  typename Epilogue_,             ///! Epilogue
-  typename ThreadblockSwizzle_    ///! Threadblock swizzling function
+  typename Mma_,                  ///! 线程块级矩阵乘累加器 - 定义核心计算逻辑和数据流
+  typename Epilogue_,             ///! 后处理器 - 处理输出变换、缩放和内存写回
+  typename ThreadblockSwizzle_    ///! 线程块调度器 - 优化内存访问和负载均衡
 >
 class GemmUniversalBatchGatherIndices{
 public:
@@ -123,57 +161,77 @@ public:
   // Structures
   //
 
-  /// Argument structure
+  /**
+   * @brief GEMM操作参数结构
+   * 
+   * 包含执行批量聚集索引GEMM操作所需的全部参数，支持稀疏注意力计算的
+   * 复杂需求。该结构继承自UniversalArgumentsBase，扩展了稀疏索引、
+   * RoPE缓存和批量处理的专门支持。
+   * 
+   * 核心功能：
+   * - 矩阵数据管理：A、B、C、D矩阵的指针和步长信息
+   * - 稀疏索引支持：gather/scatter操作的索引数组
+   * - RoPE缓存：sin/cos查找表的高效访问
+   * - 批量配置：多序列并行处理的参数设置
+   * - 内存布局：灵活的步长配置支持多种数据排列
+   */
   struct Arguments : UniversalArgumentsBase
   {
     //
-    // Data members
+    // 数据成员 - 核心计算参数
     //
 
-    typename EpilogueOutputOp::Params epilogue;
+    typename EpilogueOutputOp::Params epilogue;  ///< 后处理操作参数（缩放、偏置等）
 
-    void const * ptr_A;
-    void const * ptr_B;
-    void const * ptr_C;
-    void * ptr_D;
-    void const * ptr_sin_cache;
-    void const * ptr_cos_cache;
+    // 矩阵数据指针 - 核心计算矩阵
+    void const * ptr_A;              ///< 输入矩阵A指针（通常为Query矩阵）
+    void const * ptr_B;              ///< 输入矩阵B指针（通常为Key矩阵）
+    void const * ptr_C;              ///< 输入矩阵C指针（偏置或累加矩阵）
+    void * ptr_D;                    ///< 输出矩阵D指针（注意力分数或结果）
+    void const * ptr_sin_cache;      ///< RoPE sin值缓存指针（旋转位置编码）
+    void const * ptr_cos_cache;      ///< RoPE cos值缓存指针（旋转位置编码）
 
-    int64_t batch_stride_A;
-    int64_t batch_stride_B;
-    int64_t batch_stride_C;
+    // 批量处理步长 - 多序列并行支持
+    int64_t batch_stride_A;          ///< 矩阵A的批量步长（字节）
+    int64_t batch_stride_B;          ///< 矩阵B的批量步长（字节）
+    int64_t batch_stride_C;          ///< 矩阵C的批量步长（字节）
 
-    typename LayoutA::Stride stride_a;
-    typename LayoutB::Stride stride_b;
-    typename LayoutC::Stride stride_c;
-    typename LayoutC::Stride stride_d;
-    typename LayoutC::Stride stride_sin_cache;
-    typename LayoutC::Stride stride_cos_cache;
+    // 矩阵布局步长 - 内存访问模式定义
+    typename LayoutA::Stride stride_a;        ///< 矩阵A的行/列步长
+    typename LayoutB::Stride stride_b;        ///< 矩阵B的行/列步长
+    typename LayoutC::Stride stride_c;        ///< 矩阵C的行/列步长
+    typename LayoutC::Stride stride_d;        ///< 矩阵D的行/列步长
+    typename LayoutC::Stride stride_sin_cache; ///< sin缓存的步长
+    typename LayoutC::Stride stride_cos_cache; ///< cos缓存的步长
 
-    typename LayoutA::Stride::LongIndex lda;
-    typename LayoutB::Stride::LongIndex ldb;
-    typename LayoutC::Stride::LongIndex ldc;
-    typename LayoutC::Stride::LongIndex ldd;
-    typename LayoutC::Stride::LongIndex ld_sin_cache;
-    typename LayoutC::Stride::LongIndex ld_cos_cache;
+    // 兼容性步长 - 传统BLAS接口支持
+    typename LayoutA::Stride::LongIndex lda;        ///< 矩阵A的leading dimension
+    typename LayoutB::Stride::LongIndex ldb;        ///< 矩阵B的leading dimension
+    typename LayoutC::Stride::LongIndex ldc;        ///< 矩阵C的leading dimension
+    typename LayoutC::Stride::LongIndex ldd;        ///< 矩阵D的leading dimension
+    typename LayoutC::Stride::LongIndex ld_sin_cache; ///< sin缓存的leading dimension
+    typename LayoutC::Stride::LongIndex ld_cos_cache; ///< cos缓存的leading dimension
 
-    int const * ptr_gather_A_indices;
-    int const * ptr_gather_B_indices;
-    int const * ptr_scatter_D_indices;
-    int const * ptr_gather_sin_cache_indices;
-    int const * ptr_gather_cos_cache_indices;
+    // 稀疏索引数组 - 实现稀疏注意力模式
+    int const * ptr_gather_A_indices;        ///< 矩阵A的gather索引（稀疏Query访问）
+    int const * ptr_gather_B_indices;        ///< 矩阵B的gather索引（稀疏Key访问）
+    int const * ptr_scatter_D_indices;       ///< 矩阵D的scatter索引（稀疏结果写回）
+    int const * ptr_gather_sin_cache_indices; ///< sin缓存的gather索引（RoPE稀疏访问）
+    int const * ptr_gather_cos_cache_indices; ///< cos缓存的gather索引（RoPE稀疏访问）
 
-    int64_t batch_stride_gather_A_indices;
-    int64_t batch_stride_gather_B_indices;
-    int64_t batch_stride_scatter_D_indices;
-    int64_t batch_stride_gather_sin_cache_indices;
-    int64_t batch_stride_gather_cos_cache_indices;
+    // 稀疏索引批量步长 - 多序列稀疏模式支持
+    int64_t batch_stride_gather_A_indices;        ///< A索引数组的批量步长
+    int64_t batch_stride_gather_B_indices;        ///< B索引数组的批量步长
+    int64_t batch_stride_scatter_D_indices;       ///< D索引数组的批量步长
+    int64_t batch_stride_gather_sin_cache_indices; ///< sin索引数组的批量步长
+    int64_t batch_stride_gather_cos_cache_indices; ///< cos索引数组的批量步长
 
-    int max_seq_len;
-    int chunk_size;
-    int num_heads;
+    // 序列和注意力头配置 - Transformer模型参数
+    int max_seq_len;                         ///< 最大序列长度（内存分配上限）
+    int chunk_size;                          ///< 分块大小（计算粒度控制）
+    int num_heads;                           ///< 注意力头数量（并行度配置）
 
-    int const *ptr_offset_array;
+    int const *ptr_offset_array;             ///< 偏移数组指针（动态序列长度支持）
 
     //
     // Methods
@@ -982,61 +1040,73 @@ namespace cutlass {
 namespace gemm {
 namespace kernel {
 
+/**
+ * @brief 默认批量聚集索引GEMM配置模板
+ * 
+ * 这是ShadowKV稀疏注意力机制的核心配置模板，为不同的硬件架构、数据类型
+ * 和计算模式提供优化的GEMM内核配置。该模板自动选择最适合的MMA核心、
+ * 后处理器和内存访问模式，确保在各种GPU架构上都能获得最佳性能。
+ * 
+ * 设计理念：
+ * - 架构适配：针对Volta/Turing/Ampere等不同架构的专门优化
+ * - 类型灵活：支持FP16、BF16、FP32等多种数据类型组合
+ * - 稀疏优化：专门针对稀疏注意力模式的内存访问优化
+ * - 性能调优：通过模板特化实现最优的计算和内存配置
+ */
 template <
-    /// Element type for A matrix operand
+    /// 矩阵A的元素类型（通常为Query的数据类型）
     typename ElementA,
-    /// Layout type for A matrix operand
+    /// 矩阵A的布局类型（行主序/列主序）
     typename LayoutA,
-    /// Access granularity of A matrix in units of elements
+    /// 矩阵A的访问对齐粒度（向量化访问优化）
     int kAlignmentA,
-    /// Element type for B matrix operand
+    /// 矩阵B的元素类型（通常为Key的数据类型）
     typename ElementB,
-    /// Layout type for B matrix operand
+    /// 矩阵B的布局类型（行主序/列主序）
     typename LayoutB,
-    /// Access granularity of B matrix in units of elements
+    /// 矩阵B的访问对齐粒度（向量化访问优化）
     int kAlignmentB,
-    /// Element type for C and D matrix operands
+    /// 矩阵C和D的元素类型（输入偏置和输出结果）
     typename ElementC,
-    /// Layout type for C and D matrix operands
+    /// 矩阵C和D的布局类型（通常为行主序）
     typename LayoutC,
-    /// Element type for internal accumulation
+    /// 内部累加器的元素类型（计算精度控制）
     typename ElementAccumulator,
-    /// Operator class tag
+    /// 操作类别标签（SIMT/TensorOp/WmmaTensorOp）
     typename OperatorClass,
-    /// Tag indicating architecture to tune for
+    /// 目标架构标签（Sm70/Sm75/Sm80/Sm86等）
     typename ArchTag,
-    /// Threadblock-level tile size (concept: GemmShape)
+    /// 线程块级瓦片大小（影响共享内存使用和计算粒度）
     typename ThreadblockShape,
-    /// Warp-level tile size (concept: GemmShape)
+    /// Warp级瓦片大小（影响寄存器使用和并行度）
     typename WarpShape,
-    /// Warp-level tile size (concept: GemmShape)
+    /// 指令级瓦片大小（硬件指令粒度）
     typename InstructionShape,
-    /// Epilogue output operator
+    /// 后处理输出操作器（缩放、偏置、激活函数等）
     typename EpilogueOutputOp,
-    /// Threadblock-level swizzling operator
+    /// 线程块级调度操作器（内存访问模式优化）
     typename ThreadblockSwizzle,
-    /// Number of stages used in the pipelined mainloop
+    /// 流水线阶段数（延迟隐藏优化）
     int Stages,
-    /// If true, kernel is configured to support serial reduction in the
-    /// epilogue
+    /// 是否支持SplitK串行归约（大矩阵优化）
     bool SplitKSerial,
-    /// Operation performed by GEMM
+    /// GEMM执行的操作类型（乘法、复数乘法等）
     typename Operator,
-    /// Use zfill or predicate for out-of-bound cp.async
+    /// 共享内存清零选项（异步拷贝优化）
     SharedMemoryClearOption SharedMemoryClear = SharedMemoryClearOption::kNone,
-    /// Gather operand A by using an index array
+    /// 是否对操作数A使用索引数组进行gather操作
     bool GatherA = false,
-    /// Gather operand B by using an index array
+    /// 是否对操作数B使用索引数组进行gather操作
     bool GatherB = false,
-    /// Scatter result D by using an index array
+    /// 是否对结果D使用索引数组进行scatter操作
     bool ScatterD = false,
-    /// Permute result D
+    /// 结果D的排列布局（数据重排优化）
     typename PermuteDLayout = layout::NoPermute,
-    /// Permute operand A
+    /// 操作数A的排列布局（数据重排优化）
     typename PermuteALayout = layout::NoPermute,
-    /// Permute operand B
+    /// 操作数B的排列布局（数据重排优化）
     typename PermuteBLayout = layout::NoPermute,
-    ///
+    /// 模板特化启用条件
     typename Enable = void
 >
 struct DefaultGemmBatchGatherIndices {

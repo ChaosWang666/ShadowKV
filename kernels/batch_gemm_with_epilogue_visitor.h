@@ -32,6 +32,22 @@
 /*! \file
     \brief GEMM kernel to support the epilogue visitor model
     for customized softmax partial reduction epilogue fusion.
+    
+    文件功能：支持 epilogue visitor 模型的 GEMM 内核
+    主要用途：为 ShadowKV 的稀疏注意力机制提供自定义 softmax 部分归约 epilogue 融合
+    
+    核心特性：
+    1. Epilogue Visitor 模式：支持自定义的 epilogue 操作访问者模式
+    2. Softmax 融合：将 softmax 计算直接融合到 GEMM epilogue 中
+    3. 部分归约：支持分块的 softmax 归约操作，提高数值稳定性
+    4. 批处理支持：支持批量 GEMM 操作，适用于多头注意力
+    5. 内存优化：通过 epilogue 融合减少中间结果的内存访问
+    
+    性能优势：
+    - 减少内存带宽：避免存储中间的注意力权重矩阵
+    - 提高数值稳定性：使用在线 softmax 算法
+    - 降低延迟：GEMM 和 softmax 操作流水线化
+    - 支持稀疏模式：配合 ShadowKV 的稀疏注意力策略
 */
 
 #pragma once
@@ -51,6 +67,23 @@ namespace cutlass {
 namespace gemm {
 namespace kernel {
 
+/**
+ * BatchGemmWithEpilogueVisitor - 支持 Epilogue Visitor 的批量 GEMM 内核
+ * 
+ * 这是 ShadowKV 稀疏注意力机制的核心计算内核，将 GEMM 计算与自定义的
+ * epilogue 操作（如 softmax）融合在一起，实现高效的注意力权重计算。
+ * 
+ * 模板参数：
+ * @param Mma_ 线程块级别的矩阵乘累加操作器
+ * @param Epilogue_ Epilogue 操作器，负责后处理和输出
+ * @param ThreadblockSwizzle_ 线程块调度函数，优化 GPU 资源利用
+ * 
+ * 设计理念：
+ * - 融合计算：将 GEMM 和 softmax 操作融合，减少内存访问
+ * - 访问者模式：通过 EpilogueVisitor 支持灵活的后处理操作
+ * - 批处理优化：支持多个 GEMM 操作的批量执行
+ * - 数值稳定性：集成在线 softmax 算法，避免数值溢出
+ */
 template <typename Mma_,      ///! Threadblock-scoped matrix multiply-accumulate
           typename Epilogue_, ///! Epilogue
           typename ThreadblockSwizzle_ ///! Threadblock swizzling function
@@ -105,28 +138,34 @@ public:
   //
 
   /// Argument structure
+  /**
+   * Arguments - GEMM 操作的参数结构
+   * 
+   * 包含执行批量 GEMM 操作所需的所有参数，包括输入矩阵、输出矩阵、
+   * 以及 softmax 计算所需的辅助数据结构。
+   */
   struct Arguments {
 
     //
-    // Data members
+    // Data members - 数据成员
     //
 
-    GemmUniversalMode mode;
-    GemmCoord problem_size;
-    int batch_count;
+    GemmUniversalMode mode;        // GEMM 执行模式（标准/分割K等）
+    GemmCoord problem_size;        // 问题规模 (M, N, K)
+    int batch_count;               // 批处理数量
 
-    TensorRefA ref_A;
-    TensorRefB ref_B;
-    TensorRefC ref_C;
-    TensorRefC ref_D;
+    TensorRefA ref_A;              // 输入矩阵 A 的张量引用
+    TensorRefB ref_B;              // 输入矩阵 B 的张量引用
+    TensorRefC ref_C;              // 输入矩阵 C 的张量引用（bias）
+    TensorRefC ref_D;              // 输出矩阵 D 的张量引用
 
-    ElementNorm *ptr_Max;
-    ElementSum *ptr_Sum;
+    ElementNorm *ptr_Max;          // softmax 最大值数组指针（数值稳定性）
+    ElementSum *ptr_Sum;           // softmax 归一化因子数组指针
 
-    int64_t batch_stride_A;
-    int64_t batch_stride_B;
+    int64_t batch_stride_A;        // 矩阵 A 的批次间步长
+    int64_t batch_stride_B;        // 矩阵 B 的批次间步长
 
-    typename EpilogueVisitor::Arguments epilogue_visitor;
+    typename EpilogueVisitor::Arguments epilogue_visitor;  // Epilogue 访问者参数
 
     //
     // Methods
@@ -154,33 +193,39 @@ public:
   //
 
   /// Parameters structure
+  /**
+   * Params - 内核执行参数结构
+   * 
+   * 从 Arguments 转换而来的内核执行参数，包含所有运行时需要的
+   * 配置信息和数据指针，针对 GPU 内核执行进行了优化。
+   */
   struct Params {
 
-    cutlass::gemm::GemmCoord problem_size;
-    cutlass::gemm::GemmCoord grid_tiled_shape;
-    int swizzle_log_tile;
+    cutlass::gemm::GemmCoord problem_size;    // GEMM 问题规模
+    cutlass::gemm::GemmCoord grid_tiled_shape; // 网格瓦片形状
+    int swizzle_log_tile;                     // 瓦片调度的对数参数
 
-    typename Mma::IteratorA::Params params_A;
-    typename Mma::IteratorB::Params params_B;
-    typename EpilogueVisitor::OutputTileIterator::Params params_C;
-    typename EpilogueVisitor::OutputTileIterator::Params params_D;
+    typename Mma::IteratorA::Params params_A; // 矩阵 A 迭代器参数
+    typename Mma::IteratorB::Params params_B; // 矩阵 B 迭代器参数
+    typename EpilogueVisitor::OutputTileIterator::Params params_C; // 输出 C 迭代器参数
+    typename EpilogueVisitor::OutputTileIterator::Params params_D; // 输出 D 迭代器参数
 
-    GemmUniversalMode mode;
-    int batch_count;
-    int gemm_k_size;
+    GemmUniversalMode mode;                   // GEMM 执行模式
+    int batch_count;                          // 批处理数量
+    int gemm_k_size;                          // K 维度大小
 
-    void *ptr_A;
-    void *ptr_B;
-    ElementC *ptr_C;
-    ElementC *ptr_D;
+    void *ptr_A;                              // 矩阵 A 数据指针
+    void *ptr_B;                              // 矩阵 B 数据指针
+    ElementC *ptr_C;                          // 矩阵 C 数据指针
+    ElementC *ptr_D;                          // 矩阵 D 数据指针
 
-    ElementNorm *ptr_Max;
-    ElementSum *ptr_Sum;
+    ElementNorm *ptr_Max;                     // softmax 最大值数组
+    ElementSum *ptr_Sum;                      // softmax 求和数组
 
-    int64_t batch_stride_A;
-    int64_t batch_stride_B;
+    int64_t batch_stride_A;                   // 矩阵 A 批次步长
+    int64_t batch_stride_B;                   // 矩阵 B 批次步长
 
-    typename EpilogueVisitor::Params epilogue_visitor;
+    typename EpilogueVisitor::Params epilogue_visitor; // Epilogue 访问者参数
 
     //
     // Methods
@@ -234,13 +279,25 @@ public:
   };
 
   /// Shared memory storage structure
+  /**
+   * SharedStorage - 共享内存存储联合体
+   * 
+   * 使用联合体来优化共享内存使用，main_loop 和 epilogue 阶段
+   * 复用同一块共享内存空间，减少内存需求。
+   * 
+   * 内存布局策略：
+   * - main_loop: MMA 主循环阶段使用的共享内存
+   * - epilogue: Epilogue 阶段使用的共享内存
+   *   - epilogue: 标准 epilogue 操作的共享内存
+   *   - visitor: EpilogueVisitor 特定操作的共享内存
+   */
   union SharedStorage {
 
-    typename Mma::SharedStorage main_loop;
+    typename Mma::SharedStorage main_loop;    // 主循环共享内存
 
     struct {
-      typename Epilogue::SharedStorage epilogue;
-      typename EpilogueVisitor::SharedStorage visitor;
+      typename Epilogue::SharedStorage epilogue;  // Epilogue 共享内存
+      typename EpilogueVisitor::SharedStorage visitor; // Visitor 共享内存
     } epilogue;
   };
 

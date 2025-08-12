@@ -17,33 +17,135 @@
 ################################################################################
 */
 
+/**
+ * @file map.cuh
+ * @brief ShadowKV 稀疏注意力的高效哈希映射工具
+ * 
+ * 本文件实现了 ShadowKV 稀疏注意力机制中的核心映射操作，主要功能包括：
+ * 
+ * 1. **高效哈希映射**：基于开放寻址法的线程安全哈希表
+ * 2. **稀疏索引管理**：将稀疏位置映射到连续索引空间
+ * 3. **并行插入操作**：支持多线程并发的键值对插入
+ * 4. **快速查找机制**：优化的哈希函数和冲突解决策略
+ * 
+ * 核心设计思想：
+ * - 使用共享内存实现高速哈希表，减少全局内存访问
+ * - 采用线性探测法解决哈希冲突，保证访问的局部性
+ * - 基于原子操作实现线程安全的并发插入
+ * - 针对 GPU 架构优化的哈希函数设计
+ * 
+ * 应用场景：
+ * - 稀疏注意力中的位置索引映射
+ * - KV 缓存的稀疏访问模式优化
+ * - 动态序列长度的索引重排
+ * - 批处理中的个性化稀疏模式处理
+ * 
+ * 性能优化策略：
+ * - 2 的幂次表大小，使用位掩码代替模运算
+ * - 循环展开减少分支开销
+ * - 内存合并访问模式优化
+ * - 基于线程块的协作式初始化
+ */
 
 #ifndef MAP_CUH
 #define MAP_CUH
 
 #include <limits.h>
 
+/**
+ * 哈希表配置参数
+ * 
+ * 这些宏定义控制哈希映射的性能和行为特性：
+ */
+
+/**
+ * 空键标识符
+ * 
+ * 使用 -1 作为哈希表中空槽位的标识，因为：
+ * - 在稀疏注意力中，位置索引通常为非负数
+ * - -1 不会与有效的位置索引冲突
+ * - 便于原子比较和交换操作的实现
+ */
 #define EMPTY_KEY -1
 
 #ifndef TABLE_SIZE
+/**
+ * 哈希表大小配置
+ * 
+ * 默认值 1024 的选择考虑：
+ * - 2 的幂次：支持高效的位掩码哈希（避免昂贵的模运算）
+ * - 大于线程块大小：确保每个线程都有足够的槽位空间
+ * - 平衡内存使用：1024 * 8 字节 = 8KB 共享内存（合理范围）
+ * - 冲突概率：在典型稀疏度下提供良好的负载因子
+ * 
+ * 硬件适配建议：
+ * - A100/H100: 可增大到 2048（充足的共享内存）
+ * - V100/RTX 系列: 1024（平衡性能和资源）
+ * - 较老架构: 512-1024（受限于共享内存）
+ */
 #define TABLE_SIZE 1024 // Chosen as a power of 2 greater than 256 for efficiency
 #endif
 
 #ifndef SORT_OFFSET
+/**
+ * 偏移排序控制标志
+ * 
+ * 控制是否对稀疏偏移进行排序：
+ * - 1: 启用排序，优化内存访问局部性
+ * - 0: 禁用排序，保持原始访问顺序
+ * 
+ * 排序的权衡：
+ * - 优势：提高缓存命中率，减少内存延迟
+ * - 劣势：增加预处理开销，可能影响小规模操作
+ */
 #define SORT_OFFSET 1
 #endif
 
 #ifndef BLOCK_SIZE_MAP
+/**
+ * 映射操作的线程块大小
+ * 
+ * 针对哈希映射操作优化：
+ * - 256 线程：最大化 SM 占用率和并行度
+ * - 与哈希表大小的关系：TABLE_SIZE / BLOCK_SIZE_MAP = 4（每线程处理 4 个槽位）
+ * - 适合共享内存的协作式操作模式
+ * - 平衡计算和内存访问的工作负载
+ */
 #define BLOCK_SIZE_MAP 256
 #endif
 
-// assuming TABLE_SIZE is a power of 2
+/**
+ * @brief 快速哈希函数
+ * 
+ * 针对 GPU 架构优化的高效哈希函数，专为稀疏注意力的位置索引设计。
+ * 假设 TABLE_SIZE 是 2 的幂次，使用位掩码代替昂贵的模运算。
+ * 
+ * @tparam MAP_SIZE 映射大小（默认为 BLOCK_SIZE_MAP）
+ * @tparam LUT_SIZE 查找表大小（默认为 TABLE_SIZE）
+ * @param key 输入键值（通常是位置索引）
+ * @return 哈希值（0 到 LUT_SIZE-1 的范围内）
+ * 
+ * 设计原理：
+ * - 简单位掩码：key & (LUT_SIZE - 1)
+ *   优势：单指令完成，延迟极低
+ *   适用：位置索引具有良好的分布特性
+ * 
+ * 复杂哈希（已禁用）：
+ * - 多轮异或和乘法运算
+ *   优势：更好的分布均匀性
+ *   劣势：更高的计算开销
+ * 
+ * 性能考虑：
+ * - GPU 上位运算比乘法更快
+ * - 简单哈希在稀疏注意力场景下表现良好
+ * - 避免分支和复杂运算，保持 warp 内线程同步
+ */
 template<int MAP_SIZE = BLOCK_SIZE_MAP, int LUT_SIZE = TABLE_SIZE>
 __device__ unsigned int fast_hash(int key)
 {
-    return key & (LUT_SIZE - 1); // Simple mask for hash calculation
+    return key & (LUT_SIZE - 1); // 简单位掩码哈希计算
 
-    // complicated has key
+    // 复杂哈希函数（已禁用，保留用于特殊场景）
 #if 0
     key = ((key >> 16) ^ key) * 0x45d9f3b;
     key = ((key >> 16) ^ key) * 0x45d9f3b;
@@ -52,24 +154,84 @@ __device__ unsigned int fast_hash(int key)
 #endif
 }
 
-// insert (key, value) into a map
+/**
+ * @brief 向哈希映射中插入键值对
+ * 
+ * 使用开放寻址法（线性探测）实现线程安全的键值对插入操作。
+ * 支持多线程并发插入，是稀疏注意力索引映射的核心操作。
+ * 
+ * @tparam MAP_SIZE 映射大小（默认为 BLOCK_SIZE_MAP）
+ * @tparam LUT_SIZE 查找表大小（默认为 TABLE_SIZE）
+ * @param key 要插入的键（通常是稀疏位置索引）
+ * @param value 对应的值（通常是连续索引或线程 ID）
+ * @param map_keys 哈希表键数组指针
+ * @param map_values 哈希表值数组指针
+ * 
+ * 算法流程：
+ * 1. 计算初始哈希位置
+ * 2. 使用原子比较交换尝试插入
+ * 3. 如果冲突，线性探测到下一个位置
+ * 4. 重复直到找到空槽位或相同键
+ * 
+ * 线程安全性：
+ * - 使用 atomicCAS 保证插入的原子性
+ * - 支持多线程并发插入不同的键
+ * - 相同键的重复插入会更新值
+ * 
+ * 性能优化：
+ * - 线性探测保证内存访问的局部性
+ * - 位掩码代替模运算提高探测效率
+ * - 无锁设计避免线程阻塞
+ * 
+ * 适用场景：
+ * - 稀疏位置到连续索引的映射
+ * - 动态构建访问模式的查找表
+ * - 批处理中的个性化索引重排
+ */
 template<int MAP_SIZE = BLOCK_SIZE_MAP, int LUT_SIZE = TABLE_SIZE>
 __device__ void insert_map(int key, int value, int *map_keys, int *map_values)
 {
     unsigned int pos = fast_hash<MAP_SIZE, LUT_SIZE>(key);
     while (true)
     {
+        // 原子比较交换：如果当前位置为空，则插入新键
         int existing_key = atomicCAS(&map_keys[pos], EMPTY_KEY, key);
         if (existing_key == EMPTY_KEY || existing_key == key)
         {
+            // 成功插入或找到相同键，更新对应的值
             map_values[pos] = value;
             break;
         }
+        // 线性探测：移动到下一个位置（使用位掩码实现环形查找）
         pos = (pos + 1) & (LUT_SIZE - 1);
     }
 }
 
-// clear all keys
+/**
+ * @brief 重置哈希映射表
+ * 
+ * 清空哈希表中的所有键，将所有槽位标记为空。
+ * 使用线程块协作的方式高效地初始化整个哈希表。
+ * 
+ * @tparam MAP_SIZE 映射大小（默认为 BLOCK_SIZE_MAP）
+ * @tparam LUT_SIZE 查找表大小（默认为 TABLE_SIZE）
+ * @param map_keys 哈希表键数组指针
+ * 
+ * 算法特点：
+ * - 每个线程负责多个槽位的清理
+ * - 循环展开提高内存访问效率
+ * - 步长为 MAP_SIZE，确保内存合并访问
+ * 
+ * 性能优化：
+ * - 使用 #pragma unroll 完全展开循环
+ * - 连续内存访问模式，最大化带宽利用率
+ * - 避免分支和条件判断，保持 warp 同步
+ * 
+ * 使用场景：
+ * - 新一轮稀疏注意力计算前的表初始化
+ * - 批处理中不同样本间的表重用
+ * - 动态序列长度变化时的表重置
+ */
 template<int MAP_SIZE = BLOCK_SIZE_MAP, int LUT_SIZE = TABLE_SIZE>
 __device__ void reset_map(int *map_keys)
 {
@@ -77,72 +239,190 @@ __device__ void reset_map(int *map_keys)
 #pragma unroll
     for (int i = 0; i < LUT_SIZE; i += MAP_SIZE)
     {
-        map_keys[id] = EMPTY_KEY;
-        id += MAP_SIZE;
+        map_keys[id] = EMPTY_KEY;  // 将当前槽位标记为空
+        id += MAP_SIZE;            // 移动到下一个负责的槽位
     }
 }
 
-// init a map based on per-thead key and threadIdx.x as a value
+/**
+ * @brief 初始化哈希映射表
+ * 
+ * 基于每个线程的键值和线程 ID 初始化哈希表。
+ * 这是稀疏注意力中构建位置索引映射的标准流程。
+ * 
+ * @tparam MAP_SIZE 映射大小（默认为 BLOCK_SIZE_MAP）
+ * @tparam LUT_SIZE 查找表大小（默认为 TABLE_SIZE）
+ * @param key 每个线程要插入的键值（通常是稀疏位置索引）
+ * @param map_keys 哈希表键数组指针
+ * @param map_values 哈希表值数组指针
+ * 
+ * 算法流程：
+ * 1. 重置整个哈希表（清空所有槽位）
+ * 2. 线程块同步，确保重置完成
+ * 3. 每个线程插入自己的键值对 (key, threadIdx.x)
+ * 
+ * 设计思想：
+ * - 将稀疏位置索引映射到连续的线程 ID
+ * - 线程 ID 作为值，便于后续的数据收集操作
+ * - 支持动态的稀疏模式构建
+ * 
+ * 同步保证：
+ * - __syncthreads() 确保所有线程完成重置后再插入
+ * - 避免插入过程中的数据竞争
+ * 
+ * 应用场景：
+ * - 稀疏注意力的位置索引重排
+ * - KV 缓存的稀疏访问模式构建
+ * - 动态序列长度的索引映射
+ */
 template<int MAP_SIZE = BLOCK_SIZE_MAP, int LUT_SIZE = TABLE_SIZE>
 __device__ void init_map(int key, int *map_keys, int *map_values)
 {
-    reset_map<MAP_SIZE, LUT_SIZE>(map_keys);
-    __syncthreads();
-    insert_map<MAP_SIZE, LUT_SIZE>(key, threadIdx.x, map_keys, map_values);
+    reset_map<MAP_SIZE, LUT_SIZE>(map_keys);                              // 清空哈希表
+    __syncthreads();                                                       // 确保所有线程完成重置
+    insert_map<MAP_SIZE, LUT_SIZE>(key, threadIdx.x, map_keys, map_values); // 插入 (key, threadIdx.x) 键值对
 }
 
-// write a map from shared memory to global memory
+/**
+ * @brief 将哈希映射从共享内存写回全局内存
+ * 
+ * 高效地将共享内存中的哈希表数据传输到全局内存。
+ * 用于保存计算结果或在不同内核间传递映射信息。
+ * 
+ * @tparam MAP_SIZE 映射大小（默认为 BLOCK_SIZE_MAP）
+ * @tparam LUT_SIZE 查找表大小（默认为 TABLE_SIZE）
+ * @param s_keys 共享内存中的键数组指针
+ * @param s_values 共享内存中的值数组指针
+ * @param g_keys 全局内存中的键数组指针
+ * @param g_values 全局内存中的值数组指针
+ * 
+ * 内存布局：
+ * - 每个线程块在全局内存中有独立的 LUT_SIZE 大小区域
+ * - 偏移计算：blockIdx.x * LUT_SIZE + 线程内偏移
+ * - 保证不同线程块间的数据隔离
+ * 
+ * 性能优化：
+ * - 循环展开减少控制开销
+ * - 合并内存访问模式，最大化带宽
+ * - 每个线程处理多个元素，提高并行度
+ * 
+ * 使用场景：
+ * - 跨内核的映射信息传递
+ * - 稀疏模式的持久化存储
+ * - 多阶段计算的中间结果保存
+ */
 template<int MAP_SIZE = BLOCK_SIZE_MAP, int LUT_SIZE = TABLE_SIZE>
 __device__ void write_back_map(int *s_keys, int *s_values, int *g_keys, int *g_values)
 {
-    int id = threadIdx.x;
-    int offset = blockIdx.x * LUT_SIZE + threadIdx.x;
+    int id = threadIdx.x;                                    // 共享内存中的索引
+    int offset = blockIdx.x * LUT_SIZE + threadIdx.x;       // 全局内存中的起始偏移
 #pragma unroll
     for (int i = 0; i < LUT_SIZE; i += MAP_SIZE)
     {
-        g_keys[offset] = s_keys[id];
-        g_values[offset] = s_values[id];
-        id += MAP_SIZE;
-        offset += MAP_SIZE;
+        g_keys[offset] = s_keys[id];      // 写回键
+        g_values[offset] = s_values[id];  // 写回值
+        id += MAP_SIZE;                   // 移动到下一个共享内存位置
+        offset += MAP_SIZE;               // 移动到下一个全局内存位置
     }
 }
 
-// load a map from global memory to shared memory
+/**
+ * @brief 从全局内存加载哈希映射到共享内存
+ * 
+ * 高效地将全局内存中的哈希表数据加载到共享内存。
+ * 用于在内核开始时恢复之前保存的映射信息。
+ * 
+ * @tparam MAP_SIZE 映射大小（默认为 BLOCK_SIZE_MAP）
+ * @tparam LUT_SIZE 查找表大小（默认为 TABLE_SIZE）
+ * @param s_keys 共享内存中的键数组指针
+ * @param s_values 共享内存中的值数组指针
+ * @param g_keys 全局内存中的键数组指针
+ * @param g_values 全局内存中的值数组指针
+ * 
+ * 内存访问模式：
+ * - 从全局内存的连续区域读取数据
+ * - 写入共享内存的对应位置
+ * - 保持与 write_back_map 相同的内存布局
+ * 
+ * 性能优化：
+ * - 合并全局内存访问，最大化带宽利用率
+ * - 循环展开减少控制流开销
+ * - 并行加载提高数据传输效率
+ * 
+ * 使用场景：
+ * - 多阶段计算的状态恢复
+ * - 跨内核的映射信息传递
+ * - 预计算映射的快速加载
+ */
 template<int MAP_SIZE = BLOCK_SIZE_MAP, int LUT_SIZE = TABLE_SIZE>
 __device__ void load_map(int *s_keys, int *s_values, int *g_keys, int *g_values)
 {
-    int id = threadIdx.x;
-    int offset = blockIdx.x * LUT_SIZE + threadIdx.x;
+    int id = threadIdx.x;                                    // 共享内存中的索引
+    int offset = blockIdx.x * LUT_SIZE + threadIdx.x;       // 全局内存中的起始偏移
 
 #pragma unroll
     for (int i = 0; i < LUT_SIZE; i += MAP_SIZE)
     {
-        s_keys[id] = g_keys[offset];
-        s_values[id] = g_values[offset];
-        id += MAP_SIZE;
-        offset += MAP_SIZE;
+        s_keys[id] = g_keys[offset];      // 加载键到共享内存
+        s_values[id] = g_values[offset];  // 加载值到共享内存
+        id += MAP_SIZE;                   // 移动到下一个共享内存位置
+        offset += MAP_SIZE;               // 移动到下一个全局内存位置
     }
 }
 
-// get a value of a key in a map
+/**
+ * @brief 在哈希映射中查找键对应的值
+ * 
+ * 使用线性探测法在哈希表中查找指定键的对应值。
+ * 这是稀疏注意力中索引映射查询的核心操作。
+ * 
+ * @tparam MAP_SIZE 映射大小（默认为 BLOCK_SIZE_MAP）
+ * @tparam LUT_SIZE 查找表大小（默认为 TABLE_SIZE）
+ * @param key 要查找的键值
+ * @param map_keys 哈希表键数组指针
+ * @param map_values 哈希表值数组指针
+ * @return 找到的值，如果键不存在则返回 -1
+ * 
+ * 算法流程：
+ * 1. 计算键的初始哈希位置
+ * 2. 检查当前位置的键是否匹配
+ * 3. 如果匹配，返回对应的值
+ * 4. 如果是空槽位，说明键不存在，返回 -1
+ * 5. 否则线性探测到下一个位置，重复步骤 2-4
+ * 
+ * 性能特点：
+ * - 平均时间复杂度：O(1)
+ * - 最坏时间复杂度：O(n)（表满时）
+ * - 内存访问局部性好，缓存友好
+ * 
+ * 返回值约定：
+ * - 成功：返回键对应的值（通常是线程 ID 或连续索引）
+ * - 失败：返回 -1，表示键在映射中不存在
+ * 
+ * 使用场景：
+ * - 稀疏位置到连续索引的转换
+ * - 检查某个位置是否在稀疏模式中
+ * - 获取位置对应的处理线程 ID
+ */
 template<int MAP_SIZE = BLOCK_SIZE_MAP, int LUT_SIZE = TABLE_SIZE>
 __device__ int lookup_map(int key, int *map_keys, int *map_values)
 {
-    unsigned int pos = fast_hash<MAP_SIZE, LUT_SIZE>(key);
+    unsigned int pos = fast_hash<MAP_SIZE, LUT_SIZE>(key);  // 计算初始哈希位置
 
     while (true)
     {
         if (map_keys[pos] == key)
         {
-            // value = map_values[pos];
+            // 找到匹配的键，返回对应的值
             return map_values[pos];
         }
         if (map_keys[pos] == EMPTY_KEY)
         {
-            // value = -1; // Key not found
-            return -1;
+            // 遇到空槽位，说明键不存在
+            return -1; // Key not found
         }
-        pos = (pos + 1) & (LUT_SIZE - 1); // Linear probing
+        // 线性探测：移动到下一个位置
+        pos = (pos + 1) & (LUT_SIZE - 1);
     }
 }
 
