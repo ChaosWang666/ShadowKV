@@ -112,13 +112,34 @@ configs = {
             "baseline_bsz": 3,
             "shadowkv_bsz": 12,
         }
+    },
+    # Qwen3-MoE (2.7B) — conservative batch sizes due to smaller parameter count
+    "Qwen/Qwen3-MoE-A2.7B-Instruct": {
+        "60k": {
+            "sparse_budget": 1024,
+            "min_prompt_len": 1024*60,
+            "baseline_bsz": 16,
+            "shadowkv_bsz": 64,
+        },
+        "122k": {
+            "sparse_budget": 2048,
+            "min_prompt_len": 1024*122,
+            "baseline_bsz": 8,
+            "shadowkv_bsz": 32,
+        },
+        "244k": {
+            "sparse_budget": 4096,
+            "min_prompt_len": 1024*244,
+            "baseline_bsz": 4,
+            "shadowkv_bsz": 16,
+        }
     }
 }
 
 
 def parse_args() -> Namespace:
     p = ArgumentParser()
-    p.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "meta-llama/Meta-Llama-3.1-8B-Instruct", "01-ai/Yi-9B-200K","THUDM/glm-4-9b-chat-1m"])
+    p.add_argument("--model_name", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct", choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "meta-llama/Meta-Llama-3.1-8B-Instruct", "01-ai/Yi-9B-200K","THUDM/glm-4-9b-chat-1m", "Qwen/Qwen3-MoE-A2.7B-Instruct"])
     p.add_argument("--datalen", type=str, default="122k", choices=["60k", "122k", "244k"])
 
     return p.parse_args()

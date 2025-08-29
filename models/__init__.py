@@ -20,6 +20,7 @@
 from .glm import GLM
 from .llama import Llama
 from .qwen import Qwen2
+from .qwen3_moe import Qwen3Moe
 from .phi3 import Phi3
 
 
@@ -34,6 +35,8 @@ def choose_model_class(model_name):
         return Llama
     if 'qwen' in name:
         return Qwen2
+    if 'qwen3' in name or 'moe' in name:
+        return Qwen3Moe
     if 'phi' in name:
         return Phi3
     raise ValueError(f"Model {model_name} not found")

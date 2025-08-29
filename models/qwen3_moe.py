@@ -16,39 +16,37 @@
 ################################################################################
 
 """
-Qwen3MoE model implementation with ShadowKV optimization.
+Qwen3-MoE模型的ShadowKV实现
 
-This file implements efficient inference for Qwen3MoE series models with ShadowKV sparse attention optimization.
+本文件实现了Qwen3-MoE系列模型的高效推理功能，支持ShadowKV稀疏注意力优化。
 
-Key Features:
-1. Model Architecture:
-   - Independent Q, K, V projection weights and bias terms (inherited from Qwen2)
-   - Support for Grouped Query Attention (GQA)
-   - Efficient RoPE positional encoding
-   - Mixture of Experts (MoE): sparsely activated feedforward networks
-   - Q/K normalization: RMS normalization for query and key
+主要特性：
+1. 模型架构：
+   - 独立的Q、K、V投影权重（支持偏置项）
+   - 支持分组查询注意力（GQA）
+   - RoPE位置编码
+   - 混合专家系统（MoE）：稀疏激活，每个token路由到top-k个专家
+   - SwiGLU激活函数的前馈网络和MoE专家
 
-2. Optimization Strategies:
-   - ShadowKV sparse attention: reduce memory usage through block selection and SVD compression
-   - Efficient KV cache management: support for ultra-long context inference
-   - Memory optimization: layer-wise weight loading with timely memory release
-   - GPU acceleration: all computations on GPU
-   - MoE routing optimization: intelligent expert selection and load balancing
+2. 优化策略：
+   - ShadowKV稀疏注意力：通过块选择和SVD压缩减少内存使用
+   - 高效的KV缓存管理：支持超长上下文推理
+   - 内存优化：逐层加载权重，及时释放内存
+   - MoE专家路由：动态选择激活的专家，降低计算成本
 
-3. Template System:
-   - Built-in Qwen-specific context and chat templates
-   - Support for multi-turn dialogue and long text processing
+3. 模板系统：
+   - 内置Qwen专用的上下文和对话模板
+   - 支持多轮对话和长文本处理
 
-Main Components:
-- Qwen3MoeLayer: Weight container for single Transformer layer, including MoE structure
-- Qwen3Moe: Main model inference class, inheriting from base LLM class
+主要组件：
+- Qwen3MoeLayer: 单个Transformer层的权重容器，支持MoE和普通MLP
+- Qwen3Moe: 主要的模型推理类，继承自基础LLM类
 
-Use Cases:
-- Long text understanding and generation
-- Multi-turn dialogue systems
-- Memory-constrained inference environments
-- High-throughput applications
-- Complex tasks requiring expert system capabilities
+适用场景：
+- 需要高效推理的大规模MoE模型
+- 长文本理解和生成
+- 多轮对话系统
+- 内存受限的推理环境
 """
 
 import torch
@@ -57,148 +55,148 @@ import gc
 import time
 
 import transformers
-from transformers import AutoTokenizer
-from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from transformers import AutoTokenizer, AutoConfig
+from .modeling_qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeDecoderLayer
 transformers.logging.set_verbosity_error()
 
 from .tensor_op import layer_norm, apply_rotary_pos_emb, apply_rotary_pos_emb_single, sample_token
 from .prompt_template import Templates, Chat_Templates
 from .base import LLM
 
+
 class Qwen3MoeLayer:
     """
-    保存单层Qwen3MoE Transformer所需的权重参数
+    保存单层Qwen3-MoE Transformer所需的权重参数
     
-    该类封装了Qwen3MoE模型单个Transformer层的所有权重参数，包括：
+    该类封装了Qwen3-MoE模型单个Transformer层的所有权重参数，包括：
     - 自注意力机制的独立Q、K、V投影权重和偏置项
-    - Q/K归一化权重（Qwen3MoE特有）
     - 注意力输出投影权重
-    - MoE系统的门控网络和专家权重
-    - 层归一化的权重和方差epsilon参数
-    
-    与标准Transformer不同，Qwen3MoE包含MoE结构和Q/K归一化。
+    - 混合专家系统（MoE）或标准前馈网络权重
+    - 层归一化的权重和epsilon参数
+    - Q、K归一化权重（Qwen3-MoE特有）
     """
 
     def __init__(self, layer_idx) -> None:
         """
-        初始化Qwen3MoE层权重容器
+        初始化Qwen3-MoE层权重容器
         
         Args:
             layer_idx (int): 层索引，用于标识当前层在模型中的位置
         """
         # 自注意力机制权重（独立的Q、K、V投影）
-        self.wq :torch.Tensor = None    # Query投影权重
-        self.wk :torch.Tensor = None    # Key投影权重
-        self.wv :torch.Tensor = None    # Value投影权重
-        self.wo :torch.Tensor = None    # 注意力输出投影权重
+        self.wq: torch.Tensor = None    # Query投影权重
+        self.wk: torch.Tensor = None    # Key投影权重
+        self.wv: torch.Tensor = None    # Value投影权重
+        self.wo: torch.Tensor = None    # 注意力输出投影权重
 
-        # QKV投影的偏置项（Qwen系列特有）
-        self.bq :torch.Tensor = None    # Query投影偏置
-        self.bk :torch.Tensor = None    # Key投影偏置
-        self.bv :torch.Tensor = None    # Value投影偏置
+        # QKV投影的偏置项（如果存在）
+        self.bq: torch.Tensor = None    # Query投影偏置
+        self.bk: torch.Tensor = None    # Key投影偏置
+        self.bv: torch.Tensor = None    # Value投影偏置
+        self.bo: torch.Tensor = None    # 输出投影偏置
 
-        # Q/K归一化权重（Qwen3MoE特有）
-        self.q_norm_weight :torch.Tensor = None           # Query归一化权重
-        self.q_norm_variance_epsilon :float = 0.0         # Query归一化方差epsilon
-        self.k_norm_weight :torch.Tensor = None           # Key归一化权重
-        self.k_norm_variance_epsilon :float = 0.0         # Key归一化方差epsilon
+        # Q、K归一化权重（Qwen3-MoE特有）
+        self.q_norm_weight: torch.Tensor = None  # Query归一化权重
+        self.k_norm_weight: torch.Tensor = None  # Key归一化权重
+        self.q_norm_variance_epsilon: float = 1e-6
+        self.k_norm_variance_epsilon: float = 1e-6
 
-        # MoE系统权重
-        self.is_moe_layer :bool = False                   # 是否为MoE层
-        self.gate_weight :torch.Tensor = None             # MoE门控网络权重
-        self.num_experts :int = 0                         # 专家数量
-        self.top_k :int = 0                               # 每个token选择的专家数量
-        self.norm_topk_prob :bool = False                 # 是否归一化top-k概率
+        # MoE相关权重
+        self.is_moe_layer: bool = False             # 是否为MoE层
+        self.gate_weight: torch.Tensor = None       # MoE门控权重
+        self.num_experts: int = 0                   # 专家数量
+        self.top_k: int = 0                         # 每个token路由到的专家数量
         
-        # 专家权重列表（每个专家包含gate_proj, up_proj, down_proj）
-        self.expert_gate_projs :list[torch.Tensor] = []   # 专家门控投影权重列表
-        self.expert_up_projs :list[torch.Tensor] = []     # 专家上投影权重列表
-        self.expert_down_projs :list[torch.Tensor] = []   # 专家下投影权重列表
-        
+        # MoE专家权重列表
+        self.expert_gate_weights: list = []         # 专家门控投影权重列表
+        self.expert_up_weights: list = []           # 专家上投影权重列表  
+        self.expert_down_weights: list = []         # 专家下投影权重列表
+
         # 标准MLP权重（非MoE层使用）
-        self.gate_proj :torch.Tensor = None               # 标准门控投影权重
-        self.up_proj :torch.Tensor = None                 # 标准上投影权重
-        self.down_proj :torch.Tensor = None               # 标准下投影权重
+        self.gate_proj: torch.Tensor = None         # 门控投影权重
+        self.up_proj: torch.Tensor = None           # 上投影权重
+        self.down_proj: torch.Tensor = None         # 下投影权重
 
-        # 输入层归一化参数
-        self.input_layernorm_weight :torch.Tensor = None           # 输入层归一化权重
-        self.input_layernorm_variance_epsilon :float = 0.0         # 输入层归一化方差epsilon
+        # 层归一化参数
+        self.input_layernorm_weight: torch.Tensor = None           # 输入层归一化权重
+        self.input_layernorm_variance_epsilon: float = 1e-6        # 输入层归一化方差epsilon
 
-        # 后注意力层归一化参数
-        self.post_attention_layernorm_weight :torch.Tensor = None  # 后注意力层归一化权重
-        self.post_attention_layernorm_variance_epsilon :float = 0.0 # 后注意力层归一化方差epsilon
+        self.post_attention_layernorm_weight: torch.Tensor = None  # 后注意力层归一化权重
+        self.post_attention_layernorm_variance_epsilon: float = 1e-6 # 后注意力层归一化方差epsilon
 
         self.layer_idx = layer_idx  # 层索引
 
-    def init_parameters(self, hf_layer):
+    def init_parameters(self, hf_layer: Qwen3MoeDecoderLayer):
         """
         从HuggingFace的Qwen3MoeDecoderLayer初始化权重参数
         
         提取HuggingFace格式的权重，包括：
         - 独立的Q、K、V投影权重和偏置项
-        - Q/K归一化权重
-        - 注意力输出投影权重
-        - MoE系统或标准MLP权重
+        - 注意力输出投影权重  
+        - Q、K归一化权重
+        - MoE或标准MLP权重
         - 层归一化参数
         
         Args:
-            hf_layer: HuggingFace的Qwen3MoeDecoderLayer
+            hf_layer (Qwen3MoeDecoderLayer): HuggingFace的Qwen3-MoE解码器层
         """
+        # 提取注意力权重
+        self.wq = hf_layer.self_attn.q_proj.weight.detach()  # Query投影权重
+        self.wk = hf_layer.self_attn.k_proj.weight.detach()  # Key投影权重
+        self.wv = hf_layer.self_attn.v_proj.weight.detach()  # Value投影权重
+        self.wo = hf_layer.self_attn.o_proj.weight.detach()  # 输出投影权重
 
-        # 提取独立的QKV投影权重
-        self.wq :torch.Tensor= hf_layer.self_attn.q_proj.weight.detach()  # Query投影权重
-        self.wk :torch.Tensor= hf_layer.self_attn.k_proj.weight.detach()  # Key投影权重
-        self.wv :torch.Tensor= hf_layer.self_attn.v_proj.weight.detach()  # Value投影权重
-        self.wo :torch.Tensor= hf_layer.self_attn.o_proj.weight.detach()  # 输出投影权重
+        # 提取偏置项（如果存在）
+        if hasattr(hf_layer.self_attn.q_proj, 'bias') and hf_layer.self_attn.q_proj.bias is not None:
+            self.bq = hf_layer.self_attn.q_proj.bias.detach()
+        if hasattr(hf_layer.self_attn.k_proj, 'bias') and hf_layer.self_attn.k_proj.bias is not None:
+            self.bk = hf_layer.self_attn.k_proj.bias.detach()
+        if hasattr(hf_layer.self_attn.v_proj, 'bias') and hf_layer.self_attn.v_proj.bias is not None:
+            self.bv = hf_layer.self_attn.v_proj.bias.detach()
+        if hasattr(hf_layer.self_attn.o_proj, 'bias') and hf_layer.self_attn.o_proj.bias is not None:
+            self.bo = hf_layer.self_attn.o_proj.bias.detach()
 
-        # 提取QKV投影的偏置项（Qwen系列特有）
-        self.bq = hf_layer.self_attn.q_proj.bias.detach()  # Query投影偏置
-        self.bk = hf_layer.self_attn.k_proj.bias.detach()  # Key投影偏置
-        self.bv = hf_layer.self_attn.v_proj.bias.detach()  # Value投影偏置
-
-        # 提取Q/K归一化权重（Qwen3MoE特有）
+        # 提取Q、K归一化权重（Qwen3-MoE特有）
         self.q_norm_weight = hf_layer.self_attn.q_norm.weight.detach()
-        self.q_norm_variance_epsilon = hf_layer.self_attn.q_norm.variance_epsilon
         self.k_norm_weight = hf_layer.self_attn.k_norm.weight.detach()
+        self.q_norm_variance_epsilon = hf_layer.self_attn.q_norm.variance_epsilon
         self.k_norm_variance_epsilon = hf_layer.self_attn.k_norm.variance_epsilon
 
         # 检查是否为MoE层
-        if hasattr(hf_layer.mlp, 'gate') and hasattr(hf_layer.mlp, 'experts'):
+        from .modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+        if isinstance(hf_layer.mlp, Qwen3MoeSparseMoeBlock):
             # MoE层
             self.is_moe_layer = True
             self.gate_weight = hf_layer.mlp.gate.weight.detach()
             self.num_experts = hf_layer.mlp.num_experts
             self.top_k = hf_layer.mlp.top_k
-            self.norm_topk_prob = hf_layer.mlp.norm_topk_prob
             
             # 提取所有专家的权重
             for expert in hf_layer.mlp.experts:
-                self.expert_gate_projs.append(expert.gate_proj.weight.detach())
-                self.expert_up_projs.append(expert.up_proj.weight.detach())
-                self.expert_down_projs.append(expert.down_proj.weight.detach())
+                self.expert_gate_weights.append(expert.gate_proj.weight.detach())
+                self.expert_up_weights.append(expert.up_proj.weight.detach())
+                self.expert_down_weights.append(expert.down_proj.weight.detach())
         else:
             # 标准MLP层
             self.is_moe_layer = False
-            self.gate_proj = hf_layer.mlp.gate_proj.weight.detach()  # 门控投影权重
-            self.up_proj = hf_layer.mlp.up_proj.weight.detach()      # 上投影权重
-            self.down_proj = hf_layer.mlp.down_proj.weight.detach()  # 下投影权重
+            self.gate_proj = hf_layer.mlp.gate_proj.weight.detach()
+            self.up_proj = hf_layer.mlp.up_proj.weight.detach()
+            self.down_proj = hf_layer.mlp.down_proj.weight.detach()
 
         # 提取层归一化参数
-        self.input_layernorm_weight = hf_layer.input_layernorm.weight
+        self.input_layernorm_weight = hf_layer.input_layernorm.weight.detach()
         self.input_layernorm_variance_epsilon = hf_layer.input_layernorm.variance_epsilon
 
-        self.post_attention_layernorm_weight = hf_layer.post_attention_layernorm.weight
+        self.post_attention_layernorm_weight = hf_layer.post_attention_layernorm.weight.detach()
         self.post_attention_layernorm_variance_epsilon = hf_layer.post_attention_layernorm.variance_epsilon
-    
-    def init_gpu(self, device:str = 'cuda:0'):
+
+    def init_gpu(self, device: str = 'cuda:0'):
         """
         将所有权重参数转移到指定的GPU设备
         
         Args:
             device (str): 目标设备，默认为'cuda:0'
         """
-
-        # 使用非阻塞传输提高性能
         # 层归一化权重
         self.input_layernorm_weight = self.input_layernorm_weight.to(device, non_blocking=True)
         self.post_attention_layernorm_weight = self.post_attention_layernorm_weight.to(device, non_blocking=True)
@@ -209,53 +207,61 @@ class Qwen3MoeLayer:
         self.wv = self.wv.to(device, non_blocking=True)
         self.wo = self.wo.to(device, non_blocking=True)
         
-        # QKV偏置项
-        self.bq = self.bq.to(device, non_blocking=True)
-        self.bk = self.bk.to(device, non_blocking=True)
-        self.bv = self.bv.to(device, non_blocking=True)
-        
-        # Q/K归一化权重
+        # Q、K归一化权重
         self.q_norm_weight = self.q_norm_weight.to(device, non_blocking=True)
         self.k_norm_weight = self.k_norm_weight.to(device, non_blocking=True)
-        
-        # MoE或标准MLP权重
+
+        # 偏置项（如果存在）
+        if self.bq is not None:
+            self.bq = self.bq.to(device, non_blocking=True)
+        if self.bk is not None:
+            self.bk = self.bk.to(device, non_blocking=True)
+        if self.bv is not None:
+            self.bv = self.bv.to(device, non_blocking=True)
+        if self.bo is not None:
+            self.bo = self.bo.to(device, non_blocking=True)
+
+        # MoE或MLP权重
         if self.is_moe_layer:
+            # MoE权重
             self.gate_weight = self.gate_weight.to(device, non_blocking=True)
-            for i in range(len(self.expert_gate_projs)):
-                self.expert_gate_projs[i] = self.expert_gate_projs[i].to(device, non_blocking=True)
-                self.expert_up_projs[i] = self.expert_up_projs[i].to(device, non_blocking=True)
-                self.expert_down_projs[i] = self.expert_down_projs[i].to(device, non_blocking=True)
+            for i in range(len(self.expert_gate_weights)):
+                self.expert_gate_weights[i] = self.expert_gate_weights[i].to(device, non_blocking=True)
+                self.expert_up_weights[i] = self.expert_up_weights[i].to(device, non_blocking=True)
+                self.expert_down_weights[i] = self.expert_down_weights[i].to(device, non_blocking=True)
         else:
+            # 标准MLP权重
             self.gate_proj = self.gate_proj.to(device, non_blocking=True)
             self.up_proj = self.up_proj.to(device, non_blocking=True)
             self.down_proj = self.down_proj.to(device, non_blocking=True)
 
+
 class Qwen3Moe(LLM):
     """
-    Qwen3MoE模型的推理实现
+    Qwen3-MoE模型的推理实现
     
-    继承自基础LLM类，实现了Qwen3MoE系列模型的高效推理功能。
+    继承自基础LLM类，实现了Qwen3-MoE系列模型的高效推理功能。
     支持多种优化策略：
     - 标准全注意力模式
     - ShadowKV稀疏注意力模式
     - 高效的KV缓存管理
-    - MoE专家系统优化
+    - 混合专家系统（MoE）优化
     
     主要特性：
     - 支持超长上下文（最大64K tokens）
     - 独立的QKV投影权重和偏置项
-    - Q/K归一化机制
-    - 混合专家系统（MoE）
+    - Q、K归一化（提升训练稳定性）
     - 内存优化的KV缓存管理
     - 高效的RoPE位置编码
+    - MoE专家路由和计算
     - 内置Qwen对话模板
     """
 
     def __init__(self,
-        model_name: str = "Qwen/Qwen3-MoE-15B-A2B",
-        batch_size :int = 1,
-        max_length :int = 64*1024, 
-        device :str = 'cuda:0',
+        model_name: str = "Qwen/Qwen3-MoE-A2.7B-Instruct",
+        batch_size: int = 1,
+        max_length: int = 64*1024, 
+        device: str = 'cuda:0',
         dtype = torch.bfloat16,
         attn_mode: str = 'full',
         sparse_budget: int = 2048,
@@ -263,15 +269,15 @@ class Qwen3Moe(LLM):
         chunk_size=8,
         minference=False) -> None:
         """
-        初始化Qwen3MoE模型
+        初始化Qwen3-MoE模型
         
         Args:
-            model_name (str): HuggingFace模型名称，默认为"Qwen/Qwen3-MoE-15B-A2B"
+            model_name (str): HuggingFace模型名称
             batch_size (int): 批处理大小，当前仅支持1
             max_length (int): 最大序列长度，默认64K tokens
             device (str): 计算设备，默认为'cuda:0'
             dtype: 数据类型，默认为torch.bfloat16
-            attn_mode (str): 注意力模式，'full'为全注意力，'sparse'为稀疏注意力
+            attn_mode (str): 注意力模式，'full'为全注意力，'shadowkv'为稀疏注意力
             sparse_budget (int): 稀疏注意力预算，控制保留的token数量
             rank (int): SVD分解的秩，用于压缩key状态
             chunk_size (int): 块大小，用于分块处理
@@ -284,7 +290,7 @@ class Qwen3Moe(LLM):
         self.batch_size = batch_size
         self.device = device
         self.dtype = dtype
-        self.config = Qwen3MoeConfig.from_pretrained(model_name)  # 加载模型配置
+        self.config = AutoConfig.from_pretrained(model_name)  # 加载模型配置
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, legacy=False)  # 初始化分词器
         
@@ -292,17 +298,15 @@ class Qwen3Moe(LLM):
         self.max_length = max_length
         self.hidden_size = self.config.hidden_size                    # 隐藏层维度
         self.num_heads = self.config.num_attention_heads              # 注意力头数
-        self.head_dim = getattr(self.config, "head_dim", self.hidden_size // self.num_heads)  # 每个注意力头的维度
+        self.head_dim = self.config.hidden_size // self.config.num_attention_heads  # 每个注意力头的维度
         self.num_key_value_heads = self.config.num_key_value_heads    # KV头数（用于GQA）
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads  # KV组数
         self.max_position_embeddings = self.config.max_position_embeddings      # 最大位置编码长度
-        self.rope_theta = getattr(self.config, "rope_theta", 10000.0)           # RoPE的theta参数
+        self.rope_theta = getattr(self.config, 'rope_theta', 10000.0)           # RoPE的theta参数
+        self.vocab_size = self.config.vocab_size                      # 词汇表大小
 
         # 初始化模型参数
         self.init_parameters()
-        
-        # Create cos_sin_cache for ShadowKV compatibility
-        self.cos_sin_cache = (self.cos_cache, self.sin_cache)
         
         # 注意力模式和优化设置
         self.attn_mode = attn_mode
@@ -315,20 +319,39 @@ class Qwen3Moe(LLM):
         # 初始化KV缓存
         self.init_kv_cache(sparse_budget, rank, chunk_size, self.config)
 
-    def _set_cos_sin_cache(self, inv_freq: torch.Tensor):
+        # 如果启用MinInference优化，尝试加载预计算的注意力模式
+        if self.minference:
+            import json
+            try:
+                from minference.configs.model2path import MODEL2PATH
+                self.minference_parttern = []
+                with open(MODEL2PATH[self.model_name], 'r') as f:
+                    all_layers_pattern = json.load(f)
+                for layer_idx in range(self.num_layers):
+                    # 将head索引转换为int，保持与下游kernel的一致
+                    self.minference_parttern.append({int(ii): jj for ii, jj in all_layers_pattern[layer_idx].items()})
+            except Exception as e:
+                print(f"[Warning] Failed to load MinInference pattern for {self.model_name}, disabling minference. Error: {e}")
+                self.minference = False
+
+    def _set_cos_sin_cache(self, max_seq_len: int):
         """
         预计算RoPE的cos和sin缓存
         
         为了提高推理效率，预先计算所有位置的cos和sin值。
         
         Args:
-            inv_freq (torch.Tensor): RoPE的逆频率张量
+            max_seq_len (int): 最大序列长度
             
         Returns:
             tuple: (cos_cache, sin_cache) 预计算的cos和sin缓存
         """
+        # 计算逆频率
+        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2, dtype=torch.int64).float() / self.head_dim))
+        inv_freq = inv_freq.to(self.device)
+        
         # 生成位置索引
-        t = torch.arange(self.max_length, device=self.device, dtype=torch.int64).type_as(inv_freq)
+        t = torch.arange(max_seq_len, device=self.device, dtype=torch.int64).type_as(inv_freq)
         # 计算频率矩阵
         freqs = torch.outer(t, inv_freq)
         # 拼接频率以匹配RoPE的维度要求
@@ -344,19 +367,9 @@ class Qwen3Moe(LLM):
         - 词嵌入层权重
         - 语言模型头权重
         - 最终层归一化权重
-        - 所有Transformer层的权重（包括MoE结构）
+        - 所有Transformer层的权重（包括MoE专家）
         - RoPE的cos/sin缓存
         """
-        # 动态导入以避免循环依赖
-        try:
-            from transformers import Qwen3MoeForCausalLM
-        except ImportError:
-            # 如果Qwen3MoE不可用，尝试使用modeling_qwen3_moe
-            import sys
-            import os
-            sys.path.insert(0, os.path.dirname(__file__))
-            from modeling_qwen3_moe import Qwen3MoeForCausalLM
-        
         # 加载HuggingFace预训练模型
         hf_model = Qwen3MoeForCausalLM.from_pretrained(self.model_name, torch_dtype=self.dtype)
         
@@ -367,12 +380,12 @@ class Qwen3Moe(LLM):
         self.norm_variance_epsilon = hf_model.model.norm.variance_epsilon               # 层归一化epsilon
         
         # 预计算RoPE缓存
-        self.cos_cache, self.sin_cache = self._set_cos_sin_cache(
-            hf_model.model.rotary_emb.inv_freq.to(self.device)
-        )
+        self.cos_cache, self.sin_cache = self._set_cos_sin_cache(self.max_length)
+        # 为ShadowKV的融合RoPE内核准备cos_sin_cache（拼接前一半cos与前一半sin）
+        self.cos_sin_cache = torch.cat((self.cos_cache[:, : self.head_dim // 2], self.sin_cache[:, : self.head_dim // 2]), dim=-1)
         
         # 初始化Transformer层列表
-        self.layers :list[Qwen3MoeLayer] = []
+        self.layers: list[Qwen3MoeLayer] = []
 
         # 逐层加载权重并转移到GPU
         for idx, hf_layer in enumerate(hf_model.model.layers):
@@ -389,9 +402,9 @@ class Qwen3Moe(LLM):
         self,
         hidden_states: torch.Tensor,
         buffer: Qwen3MoeLayer,
-        num_heads:int,
-        num_key_value_heads:int,
-        head_dim:int
+        num_heads: int,
+        num_key_value_heads: int,
+        head_dim: int
     ):  
         """
         注意力计算前的预处理
@@ -399,7 +412,7 @@ class Qwen3Moe(LLM):
         执行注意力机制前的准备工作：
         1. 输入层归一化
         2. QKV投影（包含偏置项）
-        3. Q/K归一化（Qwen3MoE特有）
+        3. Q、K归一化（Qwen3-MoE特有）
         4. 重塑张量形状以适配多头注意力
         
         Args:
@@ -417,19 +430,24 @@ class Qwen3Moe(LLM):
         
         bsz, q_len, _ = hidden_states.size()
         
-        # QKV投影（包含偏置项，这是Qwen系列的特色）
+        # QKV投影（包含偏置项）
         query_states = F.linear(hidden_states, buffer.wq, bias=buffer.bq)  # Query投影
         key_states = F.linear(hidden_states, buffer.wk, bias=buffer.bk)    # Key投影
         value_states = F.linear(hidden_states, buffer.wv, bias=buffer.bv)  # Value投影
         
-        # 重塑为多头注意力格式 [batch_size, num_heads, seq_len, head_dim]
-        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        # 重塑为多头注意力格式并应用Q、K归一化
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim)
         
-        # Q/K归一化（Qwen3MoE特有）
+        # Q、K归一化（Qwen3-MoE特有，提升训练稳定性）
         query_states = layer_norm(query_states, buffer.q_norm_variance_epsilon, buffer.q_norm_weight)
         key_states = layer_norm(key_states, buffer.k_norm_variance_epsilon, buffer.k_norm_weight)
+        
+        # 转置为 [batch_size, num_heads, seq_len, head_dim]
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
         
         return query_states, key_states, value_states
     
@@ -446,7 +464,7 @@ class Qwen3Moe(LLM):
         1. 注意力输出投影
         2. 第一个残差连接
         3. 后注意力层归一化
-        4. MoE前馈网络或标准MLP
+        4. MoE前馈网络或标准SwiGLU前馈网络
         5. 第二个残差连接
         
         Args:
@@ -458,7 +476,7 @@ class Qwen3Moe(LLM):
             torch.Tensor: 处理后的隐藏状态
         """
         # 注意力输出投影
-        hidden_states = F.linear(attn_output, buffer.wo)
+        hidden_states = F.linear(attn_output, buffer.wo, bias=buffer.bo)
         # 第一个残差连接（注意力分支）
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -466,90 +484,100 @@ class Qwen3Moe(LLM):
         # 后注意力层归一化
         hidden_states = layer_norm(hidden_states, buffer.post_attention_layernorm_variance_epsilon, buffer.post_attention_layernorm_weight)
         
-        # MoE前馈网络或标准MLP
         if buffer.is_moe_layer:
+            # MoE前馈网络
             hidden_states = self._moe_forward(hidden_states, buffer)
         else:
             # 标准SwiGLU前馈网络
-            up = F.linear(hidden_states, buffer.up_proj)        # 上投影
-            gate = F.silu(F.linear(hidden_states, buffer.gate_proj))  # 门控投影 + SiLU激活
-            hidden_states = gate * up                           # 门控机制
-            hidden_states = F.linear(hidden_states, buffer.down_proj)  # 下投影
+            up = F.linear(hidden_states, buffer.up_proj)                    # 上投影
+            gate = F.silu(F.linear(hidden_states, buffer.gate_proj))        # 门控投影 + SiLU激活
+            hidden_states = gate * up                                       # 门控机制
+            hidden_states = F.linear(hidden_states, buffer.down_proj)       # 下投影
         
         # 第二个残差连接（前馈分支）
         hidden_states = residual + hidden_states
         return hidden_states
-    
+
     def _moe_forward(self, hidden_states: torch.Tensor, buffer: Qwen3MoeLayer) -> torch.Tensor:
         """
         MoE前馈网络的前向传播
         
-        实现混合专家系统的前向传播：
-        1. 门控网络选择专家
-        2. 路由权重计算和归一化
-        3. 专家计算和结果聚合
+        实现混合专家系统的路由和计算：
+        1. 通过门控网络计算专家选择权重
+        2. 选择top-k个专家
+        3. 对每个专家执行计算并加权融合
         
         Args:
-            hidden_states (torch.Tensor): 输入隐藏状态
+            hidden_states (torch.Tensor): 输入隐藏状态 [batch_size, seq_len, hidden_size]
             buffer (Qwen3MoeLayer): 当前层的权重缓冲区
             
         Returns:
-            torch.Tensor: MoE输出
+            torch.Tensor: MoE网络的输出
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+        hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
         
-        # 门控网络计算路由logits
-        router_logits = F.linear(hidden_states_flat, buffer.gate_weight)
-        
-        # 计算路由权重和选择专家
+        # 计算路由权重
+        router_logits = F.linear(hidden_states_reshaped, buffer.gate_weight)
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, buffer.top_k, dim=-1)
         
-        # 归一化top-k概率（如果启用）
-        if buffer.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        
-        # 转换回原始数据类型
+        # 归一化路由权重
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
-        
-        # 初始化输出张量
+
+        # 初始化输出
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), 
             dtype=hidden_states.dtype, 
             device=hidden_states.device
         )
-        
+
         # 创建专家掩码
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=buffer.num_experts).permute(2, 1, 0)
-        
-        # 遍历所有专家进行计算
+        expert_mask = F.one_hot(selected_experts, num_classes=buffer.num_experts).permute(2, 1, 0)
+
+        # 对每个被选中的专家执行计算
         for expert_idx in range(buffer.num_experts):
-            # 检查是否有token被路由到当前专家
             if expert_mask[expert_idx].sum() == 0:
                 continue
                 
+            # 获取当前专家处理的token索引
             idx, top_x = torch.where(expert_mask[expert_idx])
+            if len(top_x) == 0:
+                continue
             
-            # 获取当前专家需要处理的隐藏状态
-            current_state = hidden_states_flat[top_x]
+            # 提取当前专家需要处理的hidden states
+            current_state = hidden_states_reshaped[top_x]
             
-            # 专家前馈网络计算（SwiGLU）
-            up = F.linear(current_state, buffer.expert_up_projs[expert_idx])
-            gate = F.silu(F.linear(current_state, buffer.expert_gate_projs[expert_idx]))
-            expert_output = F.linear(gate * up, buffer.expert_down_projs[expert_idx])
+            # 执行专家计算：SwiGLU前馈网络
+            up = F.linear(current_state, buffer.expert_up_weights[expert_idx])
+            gate = F.silu(F.linear(current_state, buffer.expert_gate_weights[expert_idx]))
+            expert_output = gate * up
+            expert_output = F.linear(expert_output, buffer.expert_down_weights[expert_idx])
             
             # 应用路由权重
             expert_output *= routing_weights[top_x, idx, None]
             
             # 累加到最终输出
             final_hidden_states.index_add_(0, top_x, expert_output.to(hidden_states.dtype))
-        
-        # 重塑回原始形状
+
+        # 重塑为原始形状
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states
-    
 
+    @torch.inference_mode()
+    def apply_rotary_pos_emb_single(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """
+        对单个张量应用旋转位置编码（RoPE）
+        
+        Args:
+            x (torch.Tensor): 输入张量（通常是query或key）
+            position_ids (torch.Tensor): 位置索引
+            
+        Returns:
+            torch.Tensor: 应用RoPE后的张量
+        """
+        return apply_rotary_pos_emb_single(x, self.cos_cache, self.sin_cache, position_ids)
 
     @torch.inference_mode()
     def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
@@ -568,17 +596,3 @@ class Qwen3Moe(LLM):
             tuple: (rotated_q, rotated_k) 应用RoPE后的query和key张量
         """
         return apply_rotary_pos_emb(q, k, self.cos_cache, self.sin_cache, position_ids)
-    
-    @torch.inference_mode()
-    def apply_rotary_pos_emb_single(self, x: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Apply Rotary Position Embedding (RoPE) to a single tensor
-        
-        Args:
-            x (torch.Tensor): Input tensor (usually query or key)
-            position_ids (torch.Tensor): Position indices
-            
-        Returns:
-            torch.Tensor: Tensor after applying RoPE
-        """
-        return apply_rotary_pos_emb_single(x, self.cos_cache, self.sin_cache, position_ids)
